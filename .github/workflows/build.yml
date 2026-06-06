@@ -12,7 +12,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
@@ -39,17 +39,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "build failed for $name" }
             New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
             Copy-Item "target-$name/x86_64-pc-windows-msvc/release/tape-decode.exe" "dist/$name/tape-decode.exe"
+            Copy-Item "target-$name/x86_64-pc-windows-msvc/release/tape-decode.pdb" "dist/$name/tape-decode.pdb"
           }
 
-      - name: Package windows.zip
+      - name: Package windows.7z
         shell: pwsh
-        run: Compress-Archive -Path dist/* -DestinationPath windows.zip -Force
+        run: |
+          & 7z a -t7z windows.7z .\dist\*
+          if ($LASTEXITCODE -ne 0) { throw "7z packaging failed" }
 
-      - name: Upload windows.zip
-        uses: actions/upload-artifact@v4
+      - name: Upload windows.7z
+        uses: actions/upload-artifact@v7
         with:
           name: windows
-          path: windows.zip
+          path: windows.7z
 
   linux:
     name: Oracle Linux 8 (x86-64 v1-v4)
@@ -59,12 +62,12 @@ jobs:
     steps:
       - name: Install build dependencies
         run: |
-          dnf -y install gcc make zip tar findutils which
+          dnf -y install gcc make tar xz findutils which
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build all microarchitecture levels
         run: |
@@ -84,15 +87,18 @@ jobs:
               cargo build --release --target x86_64-unknown-linux-gnu --bin tape-decode
             mkdir -p "dist/$name"
             cp "target-$name/x86_64-unknown-linux-gnu/release/tape-decode" "dist/$name/tape-decode"
+            objcopy --only-keep-debug "dist/$name/tape-decode" "dist/$name/tape-decode.debug"
+            strip --strip-debug --strip-unneeded "dist/$name/tape-decode"
+            objcopy "--add-gnu-debuglink=dist/$name/tape-decode.debug" "dist/$name/tape-decode"
           done
 
-      - name: Package linux.zip
+      - name: Package linux.tar.xz
         run: |
           set -euo pipefail
-          cd dist && zip -r ../linux.zip . && cd ..
+          tar -cJf linux.tar.xz -C dist .
 
-      - name: Upload linux.zip
-        uses: actions/upload-artifact@v4
+      - name: Upload linux.tar.xz
+        uses: actions/upload-artifact@v7
         with:
           name: linux
-          path: linux.zip
+          path: linux.tar.xz
