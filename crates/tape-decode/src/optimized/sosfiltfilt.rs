@@ -49,6 +49,10 @@ pub(crate) fn sosfiltfilt_f64(sos: &[Sos<f64>], input: &[f64]) -> Vec<f64> {
 }
 
 pub(crate) fn sosfiltfilt_f32(sos: &[Sos<f32>], input_array: &[f32]) -> Vec<f32> {
+    #[cfg(nightly_portable_simd)]
+    if sos.len() == 1 && sos[0].b[2] == 0.0 && sos[0].a[2] == 0.0 {
+        return sosfiltfilt_order1_scan_f32(&sos[0], input_array);
+    }
     sosfiltfilt(sos, input_array)
 }
 
@@ -303,6 +307,143 @@ fn sosfiltfilt_order1<F: SosFloat>(section: &Sos<F>, input_array: &[F]) -> Vec<F
     for _ in 0..edge {
         index -= 1;
         step(&mut zi0, filtered[index]);
+    }
+    while index > 0 {
+        index -= 1;
+        filtered[index] = step(&mut zi0, filtered[index]);
+    }
+
+    filtered.truncate(n);
+    filtered
+}
+
+/// `sosfiltfilt_order1`, with the per-sample recurrence replaced by an 8-wide
+/// scan. The first-order state obeys `zi0[t] = A*zi0[t-1] + bff*x[t]`, a linear
+/// recurrence whose chunk solution is the decay-weighted prefix sum
+/// `zi0[j] = A^(j+1)*zin + sum_k A^(j-k)*bff*x[k]`; three shift/multiply-add
+/// steps build the sum for all 8 lanes, so the only chunk-carried value is the
+/// leaving delay. The output stays `b0*x[t] + zi0[t-1]`, read from the lanes
+/// shifted by one. Padding, seeding, and short tails reuse the scalar step.
+#[cfg(nightly_portable_simd)]
+fn sosfiltfilt_order1_scan_f32(section: &Sos<f32>, input_array: &[f32]) -> Vec<f32> {
+    use std::simd::prelude::*;
+    use std::simd::StdFloat;
+
+    const LANES: usize = 16;
+    let edge = 6;
+    let n = input_array.len();
+    assert!(n > edge);
+
+    let mut seed = [*section];
+    sosfilt_zi(&mut seed);
+    let zi0_base = seed[0].zi0;
+
+    let b0 = section.b[0];
+    let neg_a1 = -section.a[1];
+    let bff = section.b[1] - section.a[1] * section.b[0];
+
+    let mut apow_arr = [0.0f32; LANES];
+    let mut acc = 1.0f32;
+    for entry in &mut apow_arr {
+        acc *= neg_a1;
+        *entry = acc;
+    }
+    let apow = Simd::from_array(apow_arr);
+    let a_last = apow_arr[LANES - 1];
+    let zero = Simd::splat(0.0f32);
+    let vb0 = Simd::splat(b0);
+    let vbff = Simd::splat(bff);
+    let va1 = Simd::splat(neg_a1);
+    let va2 = Simd::splat(neg_a1 * neg_a1);
+    let va4 = Simd::splat(apow_arr[3]);
+    let va8 = Simd::splat(apow_arr[7]);
+
+    // One scan chunk: 16 inputs and the entering delay to 16 outputs and the
+    // leaving delay. The prefix sum `s` is independent of the entering delay,
+    // so the chunk-carried value is one scalar fused multiply-add; everything
+    // through the broadcast and output evaluation hangs off that chain.
+    let scan = |x: Simd<f32, LANES>, zin: f32| -> (Simd<f32, LANES>, f32) {
+        let g = vbff * x;
+        let s = va1.mul_add(
+            simd_swizzle!(g, zero, [16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]),
+            g,
+        );
+        let s = va2.mul_add(
+            simd_swizzle!(s, zero, [16, 17, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+            s,
+        );
+        let s = va4.mul_add(
+            simd_swizzle!(
+                s,
+                zero,
+                [16, 17, 18, 19, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            ),
+            s,
+        );
+        let s = va8.mul_add(
+            simd_swizzle!(
+                s,
+                zero,
+                [16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]
+            ),
+            s,
+        );
+        let vzin = Simd::splat(zin);
+        let zi = apow.mul_add(vzin, s);
+        let zi_prev = simd_swizzle!(
+            zi,
+            vzin,
+            [16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
+        (vb0.mul_add(x, zi_prev), a_last.mul_add(zin, s[LANES - 1]))
+    };
+
+    let step = |zi0: &mut f32, x: f32| -> f32 {
+        let out = b0.mul_add(x, *zi0);
+        *zi0 = neg_a1.mul_add(*zi0, bff * x);
+        out
+    };
+
+    let left_end = input_array[0];
+    let right_end = input_array[n - 1];
+
+    let x0 = 2.0 * left_end - input_array[edge];
+    let mut zi0 = zi0_base * x0;
+    for index in (1..=edge).rev() {
+        step(&mut zi0, 2.0 * left_end - input_array[index]);
+    }
+
+    let total = n + edge;
+    let mut filtered: Vec<f32> = Vec::with_capacity(total);
+    let mut chunks = input_array.chunks_exact(LANES);
+    for chunk in &mut chunks {
+        let (out, leaving) = scan(Simd::from_slice(chunk), zi0);
+        zi0 = leaving;
+        filtered.extend_from_slice(&out.to_array());
+    }
+    for &sample in chunks.remainder() {
+        let out = step(&mut zi0, sample);
+        filtered.push(out);
+    }
+    filtered.extend(
+        (1..=edge).map(|index| step(&mut zi0, 2.0 * right_end - input_array[n - 1 - index])),
+    );
+
+    // Backward pass in place: reverse each chunk's lanes, run the same scan,
+    // and store them back reversed.
+    let y0 = filtered[total - 1];
+    let mut zi0 = zi0_base * y0;
+    let mut index = total;
+    for _ in 0..edge {
+        index -= 1;
+        step(&mut zi0, filtered[index]);
+    }
+    while index >= LANES {
+        let x = Simd::<f32, LANES>::from_slice(&filtered[index - LANES..index]).reverse();
+        let (out, leaving) = scan(x, zi0);
+        zi0 = leaving;
+        filtered[index - LANES..index].copy_from_slice(&out.reverse().to_array());
+        index -= LANES;
     }
     while index > 0 {
         index -= 1;

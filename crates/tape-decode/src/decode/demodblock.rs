@@ -422,7 +422,14 @@ pub(crate) fn decode_video_block(
         demod = chroma_trap.work(&demod);
     }
 
-    let demod_fft = rfft_f32(&demod, spec.fft_block_r2c_f32.as_ref());
+    // After this transform the demod buffer is only read again by the raw-tbc
+    // export path, so the common path moves it into the FFT scratch instead of
+    // copying a block-sized buffer.
+    let demod_fft = if spec.rf_export_raw_tbc {
+        rfft_f32(&demod, spec.fft_block_r2c_f32.as_ref())
+    } else {
+        rfft_owned_f32(std::mem::take(&mut demod), spec.fft_block_r2c_f32.as_ref())
+    };
     let out_video_fft = spectrum_times_filter(&demod_fft, &spec.video_filter);
     let mut out_video = irfft_f32(&out_video_fft, None, spec.fft_block_c2r_f32.as_ref());
 
