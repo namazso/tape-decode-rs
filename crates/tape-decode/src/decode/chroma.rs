@@ -8,12 +8,11 @@ fn adjust_phase(
 ) {
     assert_eq!(input_data.len(), output_data.len());
 
-    let phase_adjustment = target_phase.to_radians() - input_phase.to_radians();
-    let rotation_re = phase_adjustment.cos();
-    let rotation_im = phase_adjustment.sin();
+    let phase_adjustment = (target_phase - input_phase).to_radians();
+    let (rotation_im, rotation_re) = phase_adjustment.sin_cos();
 
     for (input, output) in input_data.iter().zip(output_data.iter_mut()) {
-        *output = input.re * rotation_re - input.im * rotation_im;
+        *output = input.re.mul_add(rotation_re, -(input.im * rotation_im));
     }
 }
 
@@ -49,8 +48,7 @@ fn acc(
             1.0
         };
         for (out, &sample) in output[linestart..lineend].iter_mut().zip(line.iter()) {
-            let scaled = sample * scale;
-            *out = ((scaled + SIGNED_SAMPLE_MAX) as i64) as u16;
+            *out = (sample.mul_add(scale, SIGNED_SAMPLE_MAX) as i64) as u16;
         }
     }
 

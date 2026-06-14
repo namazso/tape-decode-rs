@@ -323,7 +323,7 @@ pub(crate) fn gen_chroma_heterodyne(
     for i in 0..field_len {
         // Reduce the (large, accumulating) carrier phase modulo a turn before
         // narrowing, so the carrier itself is evaluated over a small argument.
-        let reduced = (angle_step * i as f64 + phase_drift).rem_euclid(TAU) as f32;
+        let reduced = angle_step.mul_add(i as f64, phase_drift).rem_euclid(TAU) as f32;
         let (sin, cos) = reduced.sin_cos();
         phase0.push(-cos);
         phase1.push(sin);

@@ -291,7 +291,7 @@ fn scale_field_linear(
             let x = eval_index as f64 * eval_scale;
             let b0 = (sp.t1 - x) * sp.inv_h;
             let b1 = (x - sp.t0) * sp.inv_h;
-            let coord = b0 * sp.c0 + b1 * sp.c1;
+            let coord = b0.mul_add(sp.c0, b1 * sp.c1);
             let level_adjust = if smoothing_enabled {
                 if eval_index == 0 {
                     smoothed_adjust = raw_adjust;
@@ -366,7 +366,7 @@ fn scale_span_simd(
         let x = (Simd::splat(eval as f64) + iota) * scale;
         let b0 = (t1 - x) * inv_h;
         let b1 = (x - t0) * inv_h;
-        let coord = b0 * c0 + b1 * c1;
+        let coord = b0.mul_add(c0, b1 * c1);
         let level_adjust: Simd<f32, LANES> = if smoothing_enabled {
             let s = raw + Simd::splat(*smoothed_adjust - raw_adjust) * qpow;
             *smoothed_adjust = s[LANES - 1];
