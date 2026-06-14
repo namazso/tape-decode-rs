@@ -9,7 +9,7 @@
 pub(crate) fn sum_algebraic(values: &[f32]) -> f32 {
     const LANES: usize = 16;
     let mut chunks = values.chunks_exact(LANES);
-    let lanes_total = {
+    let lanes_total: f32 = {
         #[cfg(nightly_portable_simd)]
         {
             use std::simd::num::SimdFloat;
