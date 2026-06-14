@@ -95,7 +95,7 @@ impl DecodeWriter {
         const LOG_INTERVAL: usize = 500;
 
         let field_num = self.field_count;
-        tracing::debug!("Written field {}", self.field_count);
+        tracing::debug!("Written field {field_num}");
         if field_num.is_multiple_of(LOG_INTERVAL) {
             let elapsed = now.duration_since(*start).as_secs_f64();
             let fps = fps(field_num, elapsed);

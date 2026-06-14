@@ -139,6 +139,12 @@ fn luma_matches(a: &LumaOutput, b: &LumaOutput, mt: &MtParams) -> bool {
 
 /// Whether two fields are equal enough to stitch.
 fn fields_match(a: &WriteableField, b: &WriteableField, mt: &MtParams) -> bool {
+    if a.info.is_first_field != b.info.is_first_field {
+        return false;
+    }
+    if a.info.sync_conf != b.info.sync_conf {
+        return false;
+    }
     if !luma_matches(a.luma(), b.luma(), mt) {
         return false;
     }
