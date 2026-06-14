@@ -685,21 +685,19 @@ fn get_phase_rotation_sequence(
     Ok((chroma_rotation_index, phase_sequence, burst_phase_avg))
 }
 
-fn slice_subtract_mean<T>(data: &[T], start: isize, end: isize) -> Option<Vec<f32>>
-where
-    T: Float,
-{
+fn slice_subtract_mean(data: &[f32], start: isize, end: isize) -> Option<Vec<f32>> {
     let slice = signed_bounds_slice(data, start, end);
     if slice.is_empty() {
         return None;
     }
-    // The mean (and the centering subtraction) stay in f64 so the pedestal is
-    // removed exactly; the centered burst signal itself is then carried in f32.
+    // The mean (and the centering subtraction) stay at double precision so the
+    // pedestal is removed exactly; the centered burst signal itself is then
+    // carried in f32.
     let mean = mean_slice(slice);
     Some(
         slice
             .iter()
-            .map(|&value| (value.to_f64().unwrap() - mean) as f32)
+            .map(|&value| (f64::from(value) - mean) as f32)
             .collect(),
     )
 }
