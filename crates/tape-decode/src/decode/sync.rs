@@ -1775,23 +1775,10 @@ fn argrelmin(data: &[f32]) -> Vec<i64> {
     }
     out
 }
-
-fn sample_sign(value: f32) -> f32 {
-    if value > 0.0 {
-        1.0
-    } else if value < 0.0 {
-        -1.0
-    } else if value == 0.0 {
-        0.0
-    } else {
-        f32::NAN
-    }
-}
-
 fn zero_cross_det(data: &[f32]) -> Vec<i64> {
     let mut crossings = Vec::new();
     for i in 0..data.len().saturating_sub(1) {
-        let diff = sample_sign(data[i + 1]) - sample_sign(data[i]);
+        let diff = data[i + 1].signum() - data[i].signum();
         if diff != 0.0 {
             crossings.push(i as i64);
         }
@@ -1889,10 +1876,6 @@ fn vsyncserration_search_eq_pulses(
 
     let levels = get_serration_sync_levels(serration);
     (true, Some(data_s), Some(levels))
-}
-
-fn vsync_serration_filt(sos: &[Sos<f32>], x: &[f32]) -> Vec<f32> {
-    sosfiltfilt_f32(sos, x)
 }
 
 // Builds the vsync envelope (lowpass of the rectified signal, plus the
@@ -2016,12 +1999,12 @@ fn vsync_envelope_double(config: &DecoderSpec, data: &[f32]) -> (Vec<f32>, f32) 
 
 // Measures the harmonics of the EQ pulses.
 fn vsync_power_ratio_search(config: &DecoderSpec, data: &[f32]) -> Vec<i64> {
-    let mut first_harmonic = vsync_serration_filt(&config.resync_serration_filter_base[0], data);
-    first_harmonic = vsync_serration_filt(&config.resync_serration_filter_base[1], &first_harmonic);
+    let mut first_harmonic = sosfiltfilt_f32(&config.resync_serration_filter_base[0], data);
+    first_harmonic = sosfiltfilt_f32(&config.resync_serration_filter_base[1], &first_harmonic);
     for v in &mut first_harmonic {
         *v *= *v;
     }
-    let env = vsync_serration_filt(&config.resync_serration_filter_envelope, &first_harmonic);
+    let env = sosfiltfilt_f32(&config.resync_serration_filter_envelope, &first_harmonic);
     argrelmin(&env)
 }
 

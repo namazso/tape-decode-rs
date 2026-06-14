@@ -517,10 +517,8 @@ fn sosfilt_sample_stack<const SECTIONS: usize>(
     mut sample: f32,
     sections: &mut [Sos<f32>; SECTIONS],
 ) -> f32 {
-    let mut index = 0;
-    while index < SECTIONS {
-        sample = sos_step(&mut sections[index], sample);
-        index += 1;
+    for section in sections.iter_mut() {
+        sample = sos_step(section, sample);
     }
     sample
 }

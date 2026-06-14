@@ -408,7 +408,7 @@ fn clb_findbursts(
 
     if zc_count != 0 {
         let mut phase_deltas = Vec::with_capacity(zc_capacity);
-        for i in 0..zc_capacity {
+        for i in 0..zc_count {
             let zc_cycle = ((bstart + zcs[i] - s_rem) / zcburstdiv) + phase_adjust;
             let zc_round = (zc_cycle + 0.5) as i32;
             phase_deltas.push(zc_round as f64 - zc_cycle);
