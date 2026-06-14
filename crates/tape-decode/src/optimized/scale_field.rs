@@ -293,11 +293,7 @@ fn scale_field_linear(
             let b1 = (x - sp.t0) * sp.inv_h;
             let coord = b0.mul_add(sp.c0, b1 * sp.c1);
             let level_adjust = if smoothing_enabled {
-                if eval_index == 0 {
-                    smoothed_adjust = raw_adjust;
-                } else {
-                    smoothed_adjust = one_minus_alpha.mul_add(smoothed_adjust, alpha_raw);
-                }
+                smoothed_adjust = one_minus_alpha.mul_add(smoothed_adjust, alpha_raw);
                 smoothed_adjust
             } else {
                 raw_adjust
@@ -498,11 +494,7 @@ fn scale_field_k<const K: usize>(
             eval_spline_value_deriv_k::<K>(t, c, nt, &mut span, eval_index as f64 * eval_scale);
         let raw_adjust = adjusted(pack_wow_factor(deriv));
         let level_adjust = if smoothing_enabled {
-            if eval_index == 0 {
-                smoothed_adjust = raw_adjust;
-            } else {
-                smoothed_adjust = alpha.mul_add(raw_adjust, one_minus_alpha * smoothed_adjust);
-            }
+            smoothed_adjust = alpha.mul_add(raw_adjust, one_minus_alpha * smoothed_adjust);
             smoothed_adjust
         } else {
             raw_adjust

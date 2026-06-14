@@ -875,11 +875,11 @@ pub(crate) fn predecode_field_from_rawdecode(
                 } else {
                     linelocs_vec.clone()
                 };
-                pending_field.linelocs = Some(linelocs2_vec.clone());
                 pending_field.linebad = Some(linebad_vec.clone());
                 pending_field.valid = true;
 
                 if spec.sys_frame_lines != LineSystem::Line525 {
+                    pending_field.linelocs = Some(linelocs2_vec);
                     pending_field.out_scale =
                         Some(f64::from(0xD300 - 0x0100) / (100.0 - f64::from(spec.sys_vsync_ire)));
                     if pending_field.valid {
@@ -905,6 +905,7 @@ pub(crate) fn predecode_field_from_rawdecode(
                         pending_field.field_phase_id = Some(1);
                     }
                 } else {
+                    pending_field.linelocs = Some(linelocs2_vec.clone());
                     pending_field.out_scale =
                         Some(f64::from(0xC800 - 0x0400) / (100.0 - f64::from(spec.sys_vsync_ire)));
                     if pending_field.valid {

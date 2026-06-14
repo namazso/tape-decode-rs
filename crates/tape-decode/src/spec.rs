@@ -216,7 +216,6 @@ impl DecoderSpec {
         // Standard frequency color carrier wave.
         let fsc_wave = gen_wave_at_frequency(sys_params.fsc_mhz, out_sample_rate_mhz, fieldlen);
 
-        let chroma_afc_bpf_under_ratio = decoder_params.chroma_bpf_upper / color_under;
         let chroma_afc_out_frequency_half = out_sample_rate_mhz / 2.0;
         let chroma_afc_narrowband = if do_cafc {
             const TRANSITION_EXPAND: f64 = 12.0;
@@ -473,7 +472,7 @@ impl DecoderSpec {
                 decoder_params.chroma_bpf_order,
                 &[
                     decoder_params.chroma_bpf_lower / freq_hz_half,
-                    (color_under / 1e6) * 1e6 * chroma_afc_bpf_under_ratio / freq_hz_half,
+                    decoder_params.chroma_bpf_upper / freq_hz_half,
                 ],
                 FilterBandType::Bandpass,
             )?
@@ -551,7 +550,6 @@ impl DecoderSpec {
         let resync_divisor = level_detect_divisor as usize;
         let samp_rate = freq_hz / resync_divisor as f64;
         let fv = sys_params.fps * 2.0;
-        let fh = sys_params.fps * sys_params.frame_lines.line_count() as f64;
         let venv_limit = 5.0;
         let serration_limit = 3.0;
         let env_cutoff = fv * venv_limit;
@@ -871,7 +869,7 @@ impl DecoderSpec {
 // (DecoderSpec construction) is their sole consumer.
 
 fn t_to_samples(samp_rate: f64, time: f64) -> f64 {
-    samp_rate / (1.0 / time)
+    samp_rate * time
 }
 
 fn gen_wave_at_frequency(
