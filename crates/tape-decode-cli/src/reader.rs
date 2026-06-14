@@ -129,7 +129,9 @@ impl<F: SampleEncoding> SampleSource for Source<F> {
     }
 
     fn seek_samples(&mut self, sample: u64) -> Result<()> {
-        let target = sample * F::BYTES as u64;
+        let target = sample
+            .checked_mul(F::BYTES as u64)
+            .context("seek offset is too large for input sample width")?;
         if self.stream.is_seekable() {
             // Seekable files reposition directly, in either direction.
             self.stream

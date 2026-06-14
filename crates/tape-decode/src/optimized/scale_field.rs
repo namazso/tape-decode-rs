@@ -393,8 +393,7 @@ fn scale_span_simd(
             )
         };
         let a = p2 - p0;
-        let b = Simd::splat(2.0f32) * p0 - Simd::splat(5.0f32) * p1 + Simd::splat(4.0f32) * p2
-            - p3;
+        let b = Simd::splat(2.0f32) * p0 - Simd::splat(5.0f32) * p1 + Simd::splat(4.0f32) * p2 - p3;
         let c = Simd::splat(3.0f32) * (p1 - p2) + p3 - p0;
         let poly = c.mul_add(frac, b).mul_add(frac, a);
         let value = (Simd::splat(0.5f32) * frac).mul_add(poly, p1);
@@ -887,7 +886,7 @@ fn solve_dense(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Result<Vec<f64>> {
             }
         }
         if best == 0.0 {
-            bail!("Colocation matrix is singular.");
+            bail!("Collocation matrix is singular.");
         }
         if pivot != col {
             a.swap(pivot, col);

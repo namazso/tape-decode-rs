@@ -73,14 +73,18 @@ fn y_comb(input: &[f32], line_len: usize, limit: f32) -> Vec<f32> {
         let current = &input[range.clone()];
         let back = &input[back_start..back_start + current.len()];
         let fwd = &input[fwd_start..fwd_start + current.len()];
-        output.extend(current.iter().zip(back).zip(fwd).map(
-            |((&current, &back), &fwd)| {
-                let diffb = current - back;
-                let difff = current - fwd;
-                let clipped = (diffb + difff).clamp(-limit, limit);
-                current - clipped / 2.0
-            },
-        ));
+        output.extend(
+            current
+                .iter()
+                .zip(back)
+                .zip(fwd)
+                .map(|((&current, &back), &fwd)| {
+                    let diffb = current - back;
+                    let difff = current - fwd;
+                    let clipped = (diffb + difff).clamp(-limit, limit);
+                    current - clipped / 2.0
+                }),
+        );
     };
     let cut0 = shift.min(len - shift);
     let cut1 = shift.max(len - shift);

@@ -337,11 +337,19 @@ fn sosfiltfilt_order1_scan_f32(section: &Sos<f32>, input_array: &[f32]) -> Vec<f
     let scan = |x: Simd<f32, LANES>, zin: f32| -> (Simd<f32, LANES>, f32) {
         let g = vbff * x;
         let s = va1.mul_add(
-            simd_swizzle!(g, zero, [16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]),
+            simd_swizzle!(
+                g,
+                zero,
+                [16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            ),
             g,
         );
         let s = va2.mul_add(
-            simd_swizzle!(s, zero, [16, 17, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+            simd_swizzle!(
+                s,
+                zero,
+                [16, 17, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            ),
             s,
         );
         let s = va4.mul_add(

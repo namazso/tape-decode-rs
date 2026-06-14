@@ -132,6 +132,7 @@ impl DecodeWriter {
             append_tail(&mut chunk, metadata.as_ref(), field_count)?;
             json_file.seek(SeekFrom::Start(self.json_field_end))?;
             json_file.write_all(&chunk)?;
+            json_file.set_len(self.json_field_end + chunk.len() as u64)?;
         }
 
         Ok(())

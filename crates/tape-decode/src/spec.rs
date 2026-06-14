@@ -558,7 +558,8 @@ impl DecoderSpec {
         // copy of the rectified signal so it stays well above its own cutoff,
         // keeping its poles clear of the unit circle. Clamp the factor so it
         // never collapses to no decimation.
-        let resync_vsync_env_decimation = ((samp_rate / env_cutoff) / 60.0).floor().max(1.0) as usize;
+        let resync_vsync_env_decimation =
+            ((samp_rate / env_cutoff) / 60.0).floor().max(1.0) as usize;
         let env_samp_rate = samp_rate / resync_vsync_env_decimation as f64;
         let resync_vsync_env_filter =
             store_sos_filter(iir_lowpass_sos(env_samp_rate, env_cutoff, 1e3, 20)?);
@@ -566,8 +567,12 @@ impl DecoderSpec {
             store_sos_filter(iir_highpass_sos(samp_rate, fh, fh, 20)?),
             store_sos_filter(iir_lowpass_sos(samp_rate, fh, fh, 20)?),
         ];
-        let resync_serration_filter_envelope =
-            store_sos_filter(iir_lowpass_sos(samp_rate, fh / serration_limit, fh / 2.0, 20)?);
+        let resync_serration_filter_envelope = store_sos_filter(iir_lowpass_sos(
+            samp_rate,
+            fh / serration_limit,
+            fh / 2.0,
+            20,
+        )?);
 
         let track_phase = request.track_phase;
         if let Some(track_phase) = track_phase {

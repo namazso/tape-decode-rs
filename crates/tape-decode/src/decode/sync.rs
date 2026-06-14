@@ -2124,8 +2124,7 @@ fn findpulses_arr_reduced(
         .step_by(divisor as usize)
         .copied()
         .collect::<Vec<f32>>();
-    let (mut pulses_starts, mut pulses_lengths) =
-        findpulses_raw(&reduced, high, min_len, max_len);
+    let (mut pulses_starts, mut pulses_lengths) = findpulses_raw(&reduced, high, min_len, max_len);
 
     for start in &mut pulses_starts {
         *start *= divisor;
