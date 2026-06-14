@@ -357,18 +357,16 @@ pub(crate) fn decode_video_block(
     // pedestal; the offset is added back to the stored luma channels at the end.
     // This keeps the IIR/FFT filtering well-conditioned (the pedestal would
     // otherwise dominate the small high-frequency detail the filters extract).
-    let ire0 = f64::from(spec.sys_ire0);
+    let ire0 = spec.sys_ire0;
     let mut demod = unwrap_hilbert(&hilbert, spec.freq_hz(), spec.sys_ire0);
 
     // The diff-demod spike check compares against an absolute-Hz threshold;
     // shift it into the recentered domain by the same `ire0`.
-    let diff_demod_check_value = iretohz(ire0, f64::from(spec.sys_hz_ire), 100.0) * 2.0 - ire0;
-    if !spec.video_disable_diff_demod
-        && f64::from(max_excluding_edges(&demod, 20)) > diff_demod_check_value
-    {
+    let diff_demod_check_value = iretohz(ire0, spec.sys_hz_ire, 100.0) * 2.0 - ire0;
+    if !spec.video_disable_diff_demod && max_excluding_edges(&demod, 20) > diff_demod_check_value {
         let hilbert_diffed = ediff1d_complex_to_begin_zero(&hilbert);
         let demod_b = unwrap_hilbert(&hilbert_diffed, spec.freq_hz(), spec.sys_ire0);
-        replace_spikes(&mut demod, &demod_b, diff_demod_check_value as f32, 8, 30);
+        replace_spikes(&mut demod, &demod_b, diff_demod_check_value, 8, 30);
     }
 
     // The video-EQ and chroma-trap stages are only active for a few formats.

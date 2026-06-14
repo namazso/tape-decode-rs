@@ -30,15 +30,15 @@ use field::predecode_field_from_rawdecode;
 use sync::ResyncState;
 use vits::compute_vits_metrics;
 
-pub(crate) fn iretohz(ire0: f64, hz_ire: f64, ire: f64) -> f64 {
+pub(crate) fn iretohz(ire0: f32, hz_ire: f32, ire: f32) -> f32 {
     ire0 + (hz_ire * ire)
 }
 
-fn hztoire(ire0: f64, hz_ire: f64, hz: f64) -> f64 {
+fn hztoire(ire0: f32, hz_ire: f32, hz: f32) -> f32 {
     (hz - ire0) / hz_ire
 }
 
-fn inrange(a: f64, mi: f64, ma: f64) -> bool {
+fn inrange<T: PartialOrd>(a: T, mi: T, ma: T) -> bool {
     a >= mi && a <= ma
 }
 
@@ -510,12 +510,12 @@ fn demod_slice_bounds(len: usize, start: i64, end: i64) -> Option<(usize, usize)
     (start < end).then_some((start, end))
 }
 
-fn demod_mean(data: &[f32], start: i64, end: i64) -> f64 {
+fn demod_mean(data: &[f32], start: i64, end: i64) -> f32 {
     let Some((start, end)) = demod_slice_bounds(data.len(), start, end) else {
-        return f64::NAN;
+        return f32::NAN;
     };
     let slice = &data[start..end];
-    f64::from(slice.iter().sum::<f32>() / slice.len() as f32)
+    slice.iter().sum::<f32>() / slice.len() as f32
 }
 
 type PhaseSequenceEntry = (usize, usize, f64, f64, f64, f64);
@@ -644,13 +644,13 @@ pub struct DecoderMetadata {
 }
 
 #[derive(Clone)]
-struct StackableMa {
+struct StackableMa<T> {
     window_average: usize,
     min_watermark: usize,
-    stack: Vec<f64>,
+    stack: Vec<T>,
 }
 
-impl StackableMa {
+impl<T: Float + std::iter::Sum> StackableMa<T> {
     fn new(min_watermark: usize, window_average: usize) -> Self {
         Self {
             window_average,
@@ -659,14 +659,17 @@ impl StackableMa {
         }
     }
 
-    fn push(&mut self, value: f64) {
+    fn push(&mut self, value: T) {
         self.stack.push(value);
     }
 
-    fn pull(&mut self) -> Option<f64> {
+    fn pull(&mut self) -> Option<T> {
         let keep_from = self.stack.len().saturating_sub(self.window_average);
         self.stack.drain(..keep_from);
-        (!self.stack.is_empty()).then(|| mean(&self.stack))
+        (!self.stack.is_empty()).then(|| {
+            let sum: T = self.stack.iter().copied().sum();
+            sum / T::from(self.stack.len()).unwrap()
+        })
     }
 
     fn has_values(&self) -> bool {
@@ -687,8 +690,8 @@ struct ChromaAfcState {
     cc_freq_mhz: f64,
     chroma_heterodyne: Vec<Vec<f32>>,
     // CAFC-only drift stacks (None when CAFC is disabled).
-    meas_stack: Option<StackableMa>,
-    chroma_log_drift: Option<StackableMa>,
+    meas_stack: Option<StackableMa<f64>>,
+    chroma_log_drift: Option<StackableMa<f64>>,
 }
 
 fn chroma_afc_chainfiltfilt(config: &DecoderSpec, data: &[f32]) -> Vec<f32> {
@@ -1590,14 +1593,14 @@ impl Decoder {
     pub fn metadata(&self) -> Option<DecoderMetadata> {
         let spec: &DecoderSpec = &self.spec;
         let metadata_field = self.metadata_field?;
-        let ire_to_output = |ire: f64| {
+        let ire_to_output = |ire: f32| {
             hz_to_output_scalar(
                 spec,
-                iretohz(f64::from(spec.sys_ire0), f64::from(spec.sys_hz_ire), ire),
+                f64::from(iretohz(spec.sys_ire0, spec.sys_hz_ire, ire)),
                 metadata_field.out_scale,
             )
         };
-        let black = ire_to_output(spec.black_ire());
+        let black = ire_to_output(spec.black_ire() as f32);
         let white = ire_to_output(100.0);
         let to_sample = |us: f64| (us * spec.sys_outfreq + BADJ).round_ties_even() as i64;
         let system = match (spec.sys_frame_lines, spec.color_system) {

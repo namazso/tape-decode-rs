@@ -767,18 +767,18 @@ fn count_phase_votes(
     phase_cnt
 }
 
-fn demod_std(data: &[f32], start: i64, end: i64) -> f64 {
+fn demod_std(data: &[f32], start: i64, end: i64) -> f32 {
     let Some((start, end)) = demod_slice_bounds(data.len(), start, end) else {
-        return f64::NAN;
+        return f32::NAN;
     };
     // Population standard deviation == RMS of the mean-centered samples.
-    rms(&data[start..end])
+    rms(&data[start..end]) as f32
 }
 
 /// Mean and standard deviation of the demod samples in the gap between
 /// consecutive pulses `a` and `a + 1` (the back porch / active interval), with
 /// a fixed 40-sample inset on each side to skip the pulse edges.
-fn pulse_gap_stats(demod_05: &[f32], pulses: &[PulseSample], a: usize) -> (f64, f64) {
+fn pulse_gap_stats(demod_05: &[f32], pulses: &[PulseSample], a: usize) -> (f32, f32) {
     let start = pulses[a].start + pulses[a].len + 40;
     let end = pulses[a + 1].start - 40;
     (
@@ -1400,8 +1400,8 @@ fn try_get_pulses_core(
     let field_lines = (spec.sys_field_lines[0], spec.sys_field_lines[1]);
     let eq_pulselen = spec.resync_eq_pulselen() as f64;
     let long_pulse_max = spec.resync_long_pulse_max();
-    let ire0 = f64::from(spec.sys_ire0);
-    let hz_ire = f64::from(spec.sys_hz_ire);
+    let ire0 = spec.sys_ire0;
+    let hz_ire = spec.sys_hz_ire;
     let is_ntsc = spec.sys_frame_lines == LineSystem::Line525;
 
     let mut raw_pulses = raw_pulse_starts
@@ -1483,13 +1483,9 @@ fn try_get_pulses_core(
             let data =
                 demod_checked_slice(&field.data.video.demod_05, curpulse.start, curpulse.len)
                     .context("long-pulse correction slice is empty")?;
-            let threshold = iretohz(
-                ire0,
-                hz_ire,
-                hztoire(ire0, hz_ire, f64::from(data[0])) - 10.0,
-            );
+            let threshold = iretohz(ire0, hz_ire, hztoire(ire0, hz_ire, data[0]) - 10.0);
             let (pulses_starts, pulses_lengths) =
-                findpulses_raw(data, threshold as f32, eq_pulselen / 8.0, long_pulse_max);
+                findpulses_raw(data, threshold, eq_pulselen / 8.0, long_pulse_max);
             if let (Some(&start), Some(&len)) = (pulses_starts.first(), pulses_lengths.first()) {
                 raw_pulses[i] = PulseSample {
                     start: curpulse.start + start,
@@ -1674,13 +1670,9 @@ fn resync_get_pulses(
     resync_state: &mut ResyncState,
 ) -> (Vec<i64>, Vec<i64>) {
     let ctx = GpCtx {
-        sp_ire0: f64::from(spec.sys_ire0),
-        sp_hz_ire: f64::from(spec.sys_hz_ire),
-        sp_vsync_hz: iretohz(
-            f64::from(spec.sys_ire0),
-            f64::from(spec.sys_hz_ire),
-            f64::from(spec.sys_vsync_ire),
-        ),
+        sp_ire0: spec.sys_ire0,
+        sp_hz_ire: spec.sys_hz_ire,
+        sp_vsync_hz: iretohz(spec.sys_ire0, spec.sys_hz_ire, spec.sys_vsync_ire),
         sp_vsync_pulse_us: spec.sys_vsync_pulse_us,
 
         rf_linelen: spec.linelen() as f64,
@@ -1741,14 +1733,14 @@ pub(crate) fn try_get_pulses(
     }))
 }
 
-fn findpulses_range(ire0: f64, hz_ire: f64, vsync_hz: f64, blank_hz: f64) -> (f64, f64) {
+fn findpulses_range(ire0: f32, hz_ire: f32, vsync_hz: f32, blank_hz: f32) -> (f32, f32) {
     let sync_ire = hztoire(ire0, hz_ire, vsync_hz);
     let pulse_hz_min = iretohz(ire0, hz_ire, sync_ire - 10.0);
     let pulse_hz_max = (iretohz(ire0, hz_ire, sync_ire) + blank_hz) / 2.0;
     (pulse_hz_min, pulse_hz_max)
 }
 
-fn get_serration_sync_levels(serration: &[f32]) -> (f64, f64) {
+fn get_serration_sync_levels(serration: &[f32]) -> (f32, f32) {
     // The split threshold (the window mean) is accumulated in f64 so the
     // partition boundary stays exact; the per-group medians run in f32.
     let half_amp =
@@ -1758,13 +1750,13 @@ fn get_serration_sync_levels(serration: &[f32]) -> (f64, f64) {
         .copied()
         .partition(|&value| value > half_amp);
     (
-        f64::from(median_from_values(&mut valleys)),
-        f64::from(median_from_values(&mut peaks)),
+        median_from_values(&mut valleys),
+        median_from_values(&mut peaks),
     )
 }
 
-fn median_slice<T: Float>(values: &[T]) -> f64 {
-    let mut values: Vec<f64> = values.iter().map(|&v| v.to_f64().unwrap()).collect();
+fn median_slice(values: &[f32]) -> f32 {
+    let mut values = values.to_vec();
     median_from_values(&mut values)
 }
 
@@ -1850,7 +1842,7 @@ fn vsyncserration_search_eq_pulses(
     data: &[f32],
     pos: usize,
     linespan: usize,
-) -> (bool, Option<usize>, Option<(f64, f64)>) {
+) -> (bool, Option<usize>, Option<(f32, f32)>) {
     let linelen = config.resync_linelen_downsampled();
     let eq_pulselen = config.resync_eq_pulselen_downsampled();
     let (vbi_time_range_min, vbi_time_range_max) = config.resync_vbi_time_range();
@@ -1858,17 +1850,12 @@ fn vsyncserration_search_eq_pulses(
     let end = (data.len() - 1).min(pos + linelen * linespan);
     let min_block = &data[start..end];
 
-    // `data` is the f32 sync buffer; widen each sample to f64 for the level math
-    // (lossless f32->f64), keeping these computations bit-identical to the old
-    // f64 buffer.
-    let min_block_min = f64::from(min_block.iter().copied().fold(f32::INFINITY, f32::min));
+    let min_block_min = min_block.iter().copied().fold(f32::INFINITY, f32::min);
     let level = (median_slice(min_block) - min_block_min) / 2.0 + min_block_min;
 
-    // Center in f64 (so the midpoint subtraction does not cancel two multi-MHz
-    // values) and carry the sign-crossing signal in f32.
     let zero_block = min_block
         .iter()
-        .map(|&sample| (f64::from(sample) - level) as f32)
+        .map(|&sample| sample - level)
         .collect::<Vec<_>>();
     let sync_pulses = zero_cross_det(&zero_block);
 
@@ -2044,7 +2031,7 @@ fn resync_pulses_blacklevel(
     pulse_starts: &[i64],
     pulse_lengths: &[i64],
     vsync_locs: &[i64],
-) -> Option<Vec<f64>> {
+) -> Option<Vec<f32>> {
     if vsync_locs.is_empty() {
         return None;
     }
@@ -2103,7 +2090,7 @@ fn resync_fallback_vsync_loc_means(
     sample_freq_mhz: f64,
     min_len: f64,
     max_len: f64,
-) -> (Vec<i64>, Vec<f64>) {
+) -> (Vec<i64>, Vec<f32>) {
     let mean_pos_offset = sample_freq_mhz;
     let mut vsync_locs = Vec::new();
     let mut vsync_means = Vec::new();
@@ -2124,7 +2111,7 @@ fn resync_fallback_vsync_loc_means(
 
 fn findpulses_arr_reduced(
     sync_ref: &[f32],
-    high: f64,
+    high: f32,
     divisor: i64,
     eq_pulselen: f64,
     long_pulse_max: f64,
@@ -2132,15 +2119,13 @@ fn findpulses_arr_reduced(
     let min_len = (eq_pulselen / 8.0) / divisor as f64;
     let max_len = long_pulse_max / divisor as f64;
 
-    // `sync_ref` is already f32; keep the decimated buffer in f32 to halve this
-    // field/divisor-sized buffer.
     let reduced = sync_ref
         .iter()
         .step_by(divisor as usize)
         .copied()
         .collect::<Vec<f32>>();
     let (mut pulses_starts, mut pulses_lengths) =
-        findpulses_raw(&reduced, high as f32, min_len, max_len);
+        findpulses_raw(&reduced, high, min_len, max_len);
 
     for start in &mut pulses_starts {
         *start *= divisor;
@@ -2152,7 +2137,7 @@ fn findpulses_arr_reduced(
     (pulses_starts, pulses_lengths)
 }
 
-fn check_levels(ctx: &GpCtx, data: &[f32], new_sync: f64, new_blank: f64) -> bool {
+fn check_levels(ctx: &GpCtx, data: &[f32], new_sync: f32, new_blank: f32) -> bool {
     let blank_sync_ire_diff = (new_blank - new_sync) / ctx.sp_hz_ire;
 
     if (ctx.sp_vsync_hz - new_sync) > (ctx.sp_hz_ire * 15.0) || blank_sync_ire_diff > 47.0 {
@@ -2163,15 +2148,13 @@ fn check_levels(ctx: &GpCtx, data: &[f32], new_sync: f64, new_blank: f64) -> boo
     }
 
     let len = data.len() as f64;
-    let new_sync_f = new_sync as f32;
-    let new_blank_f = new_blank as f32;
     let mut below_sync = 0usize;
     let mut below_blank = 0usize;
     for &sample in data {
-        if sample < new_sync_f {
+        if sample < new_sync {
             below_sync += 1;
         }
-        if sample < new_blank_f {
+        if sample < new_blank {
             below_blank += 1;
         }
     }
@@ -2189,9 +2172,9 @@ fn check_levels(ctx: &GpCtx, data: &[f32], new_sync: f64, new_blank: f64) -> boo
 // DecoderSpec.
 
 struct VsyncSerrationState {
-    levels_sync: StackableMa,
-    levels_blank: StackableMa,
-    sync_level_bias: f64,
+    levels_sync: StackableMa<f32>,
+    levels_blank: StackableMa<f32>,
+    sync_level_bias: f32,
     fieldcount: i64,
     found_serration: bool,
 }
@@ -2204,13 +2187,13 @@ impl VsyncSerrationState {
         VsyncSerrationState {
             levels_sync: mk_ma(),
             levels_blank: mk_ma(),
-            sync_level_bias: f64::NAN,
+            sync_level_bias: f32::NAN,
             fieldcount: 0,
             found_serration: false,
         }
     }
 
-    fn push_levels_internal(&mut self, sync: f64, blank: f64) {
+    fn push_levels_internal(&mut self, sync: f32, blank: f32) {
         self.levels_sync.push(sync);
         self.levels_blank.push(blank);
     }
@@ -2235,7 +2218,7 @@ impl VsyncSerrationState {
         let mut padded: Vec<f32> = data[..p].iter().rev().copied().collect();
         padded.extend_from_slice(data);
         let (forward0, forward1) = vsync_envelope_double(config, &padded);
-        self.sync_level_bias = f64::from(forward1);
+        self.sync_level_bias = forward1;
         let start = padding.min(forward0.len());
         // argrelmin only compares neighbours, so subtracting the constant
         // sync_level_bias would not move any minima; run it on forward0 directly.
@@ -2282,7 +2265,7 @@ impl VsyncSerrationState {
         self.fieldcount += 1;
     }
 
-    fn pull_levels(&mut self) -> (Option<f64>, Option<f64>) {
+    fn pull_levels(&mut self) -> (Option<f32>, Option<f32>) {
         (self.levels_sync.pull(), self.levels_blank.pull())
     }
 
@@ -2294,8 +2277,8 @@ impl VsyncSerrationState {
 // Mutable field level memory; moving-average sizing lives in DecoderSpec.
 
 struct FieldStateState {
-    blanklevels: StackableMa,
-    synclevels: StackableMa,
+    blanklevels: StackableMa<f32>,
+    synclevels: StackableMa<f32>,
 }
 
 impl FieldStateState {
@@ -2307,20 +2290,20 @@ impl FieldStateState {
         }
     }
 
-    fn set_sync_level(&mut self, level: f64) {
+    fn set_sync_level(&mut self, level: f32) {
         self.synclevels.push(level);
     }
 
-    fn set_levels(&mut self, sync: f64, blank: f64) {
+    fn set_levels(&mut self, sync: f32, blank: f32) {
         self.blanklevels.push(blank);
         self.set_sync_level(sync);
     }
 
-    fn pull_sync_level(&mut self) -> Option<f64> {
+    fn pull_sync_level(&mut self) -> Option<f32> {
         self.synclevels.pull()
     }
 
-    fn pull_levels(&mut self) -> (Option<f64>, Option<f64>) {
+    fn pull_levels(&mut self) -> (Option<f32>, Option<f32>) {
         let blevels = self.blanklevels.pull();
         if blevels.is_some() {
             (self.pull_sync_level(), blevels)
@@ -2335,9 +2318,9 @@ impl FieldStateState {
 }
 
 struct GpCtx {
-    sp_ire0: f64,
-    sp_hz_ire: f64,
-    sp_vsync_hz: f64,
+    sp_ire0: f32,
+    sp_hz_ire: f32,
+    sp_vsync_hz: f32,
     sp_vsync_pulse_us: f64,
     rf_linelen: f64,
     rf_samplesperline: f64,
@@ -2353,7 +2336,7 @@ struct GpCtx {
 pub(crate) struct ResyncState {
     vsync_serration: VsyncSerrationState,
     field_state: FieldStateState,
-    last_pulse_threshold: f64,
+    last_pulse_threshold: f32,
 }
 
 impl ResyncState {
@@ -2362,12 +2345,12 @@ impl ResyncState {
             vsync_serration: VsyncSerrationState::new(),
             field_state: FieldStateState::new(config),
             last_pulse_threshold: {
-                let ire0 = f64::from(config.sys_ire0);
-                let hz_ire = f64::from(config.sys_hz_ire);
+                let ire0 = config.sys_ire0;
+                let hz_ire = config.sys_hz_ire;
                 findpulses_range(
                     ire0,
                     hz_ire,
-                    iretohz(ire0, hz_ire, f64::from(config.sys_vsync_ire)),
+                    iretohz(ire0, hz_ire, config.sys_vsync_ire),
                     iretohz(ire0, hz_ire, 0.0),
                 )
                 .1
@@ -2379,7 +2362,7 @@ impl ResyncState {
         self.field_state.has_levels()
     }
 
-    pub(crate) fn last_pulse_threshold(&self) -> f64 {
+    pub(crate) fn last_pulse_threshold(&self) -> f32 {
         self.last_pulse_threshold
     }
 
@@ -2396,7 +2379,7 @@ impl ResyncState {
     }
 
     // Do a level check
-    fn level_check(ctx: &GpCtx, sync: f64, blank: f64, sync_reference: &[f32]) -> bool {
+    fn level_check(ctx: &GpCtx, sync: f32, blank: f32, sync_reference: &[f32]) -> bool {
         check_levels(ctx, sync_reference, sync, blank)
     }
 
@@ -2408,7 +2391,7 @@ impl ResyncState {
         pulse_starts: &[i64],
         pulse_lengths: &[i64],
         store_in_field_state: bool,
-    ) -> Option<(f64, f64)> {
+    ) -> Option<(f32, f32)> {
         let vsync_len_px = Self::vsync_len_px(ctx);
         let min_len = vsync_len_px * 0.8;
         let max_len = vsync_len_px * 1.2;
@@ -2436,10 +2419,10 @@ impl ResyncState {
         );
         let mut blacklevel = match black_means {
             Some(ref v) if !v.is_empty() => median_slice(v),
-            _ => f64::NAN,
+            _ => f32::NAN,
         };
         if blacklevel < synclevel {
-            blacklevel = f64::NAN;
+            blacklevel = f32::NAN;
         }
         if blacklevel.is_nan() || synclevel.is_nan() {
             tracing::debug!("blacklevel or synclevel had a NaN!");
@@ -2468,7 +2451,7 @@ impl ResyncState {
             blank = b.unwrap();
         } else {
             let ire_step = 5.0;
-            let mut min_sync = f64::from(demod_05.iter().copied().fold(f32::INFINITY, f32::min));
+            let mut min_sync = demod_05.iter().copied().fold(f32::INFINITY, f32::min);
             let mut retries = 30;
             let vsync_len_px = Self::vsync_len_px(ctx);
             let min_vsync_check = vsync_len_px * 0.8;
@@ -2539,7 +2522,7 @@ impl ResyncState {
                             );
                             let r = findpulses_raw(
                                 demod_05,
-                                pulse_hz_max as f32,
+                                pulse_hz_max,
                                 config.resync_eq_pulselen() as f64 / 8.0,
                                 long_pulse_max,
                             );
@@ -2573,7 +2556,7 @@ impl ResyncState {
         let (_, pulse_hz_max) = findpulses_range(ctx.sp_ire0, ctx.sp_hz_ire, sync, blank);
         let (pulses_starts, pulses_lengths) = findpulses_raw(
             demod_05,
-            pulse_hz_max as f32,
+            pulse_hz_max,
             config.resync_eq_pulselen() as f64 / 8.0,
             config.resync_long_pulse_max(),
         );
@@ -2634,13 +2617,12 @@ impl ResyncState {
                 blank = b.unwrap();
             }
             let dc_offset = ctx.sp_ire0 - blank;
-            let dc_offset_f = dc_offset as f32;
             for v in sync_reference.iter_mut() {
-                *v += dc_offset_f;
+                *v += dc_offset;
             }
             if !ctx.disable_dc_offset {
                 for v in demod_data.iter_mut() {
-                    *v += dc_offset_f;
+                    *v += dc_offset;
                 }
             }
             sync += dc_offset;
@@ -2669,9 +2651,7 @@ impl ResyncState {
             if !(ctx.disable_dc_offset || pulse_hz_min < new_sync && new_sync < ctx.sp_vsync_hz)
                 && check
             {
-                // Fold the recentering constants once so the per-sample shift is
-                // a single f32 add instead of a widened subtract-and-add.
-                let recenter = (ctx.sp_vsync_hz - new_sync) as f32;
+                let recenter = ctx.sp_vsync_hz - new_sync;
                 for v in sync_reference.iter_mut() {
                     *v += recenter;
                 }
@@ -2683,7 +2663,7 @@ impl ResyncState {
         self.last_pulse_threshold = pulse_hz_max;
         let (starts, lengths) = findpulses_raw(
             sync_reference,
-            pulse_hz_max as f32,
+            pulse_hz_max,
             config.resync_eq_pulselen() as f64 / 8.0,
             config.resync_long_pulse_max(),
         );

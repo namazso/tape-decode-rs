@@ -139,11 +139,9 @@ fn refine_linelocs_hsync(
 
     let one_usec = spec.freq as usize;
     let is_pal = spec.sys_frame_lines != LineSystem::Line525;
-    let ire0_hz = f64::from(spec.sys_ire0);
-    let hz_ire_f = f64::from(spec.sys_hz_ire);
-    let ire_30 = iretohz(ire0_hz, hz_ire_f, 30.0) as f32;
-    let ire_n_65 = iretohz(ire0_hz, hz_ire_f, -65.0) as f32;
-    let ire_110 = iretohz(ire0_hz, hz_ire_f, 110.0) as f32;
+    let ire_30 = iretohz(spec.sys_ire0, spec.sys_hz_ire, 30.0);
+    let ire_n_65 = iretohz(spec.sys_ire0, spec.sys_hz_ire, -65.0);
+    let ire_110 = iretohz(spec.sys_ire0, spec.sys_hz_ire, 110.0);
 
     let mut linelocs_refined = initial_linelocs.to_vec();
     let mut refined_from_right_lineloc = -1.0;
@@ -874,7 +872,7 @@ pub(crate) fn predecode_field_from_rawdecode(
                         &pending_field.data.video.demod_05,
                         &mut linebad_vec,
                         normal_hsync_length,
-                        resync_state.last_pulse_threshold() as f32,
+                        resync_state.last_pulse_threshold(),
                     )?
                 } else {
                     linelocs_vec.clone()
