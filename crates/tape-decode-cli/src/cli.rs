@@ -17,7 +17,7 @@ use crate::profiles::{flatten_profile, load_profile, load_profile_file, profile_
 use crate::reader::{open_source, DecodeReader, SampleFormat};
 use crate::writer::DecodeWriter;
 use tape_decode::{
-    DecodeRequest, DecoderSpec, DropOuts, FieldInfoEntry, FieldOrderAction, NotchFilter,
+    DecodeRequest, DecoderSpec, DropOuts, FieldInfoEntry, FieldOrderAction, NotchFilter, SecamMode,
     WowInterpolation,
 };
 
@@ -39,6 +39,23 @@ impl From<CliFieldOrderAction> for FieldOrderAction {
             CliFieldOrderAction::Duplicate => FieldOrderAction::Duplicate,
             CliFieldOrderAction::Drop => FieldOrderAction::Drop,
             CliFieldOrderAction::None => FieldOrderAction::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliSecamMode {
+    /// Re-modulate as pseudo-PAL, decodable by a standard PAL chroma decoder.
+    PseudoPal,
+    /// Emit the raw demodulated Db/Dr per line, without PAL re-modulation.
+    RawDemod,
+}
+
+impl From<CliSecamMode> for SecamMode {
+    fn from(value: CliSecamMode) -> Self {
+        match value {
+            CliSecamMode::PseudoPal => SecamMode::PseudoPal,
+            CliSecamMode::RawDemod => SecamMode::RawDemod,
         }
     }
 }
@@ -219,6 +236,27 @@ struct DecodeArgs {
     /// Disable chroma comb filtering.
     #[arg(long)]
     no_comb: bool,
+    /// Decode SECAM chroma by FM-demodulating the subcarrier. Without a value
+    /// (`--secam`) defaults to `pseudo-pal`: re-modulate the recovered colour
+    /// difference as a pseudo-PAL signal a standard PAL chroma decoder can
+    /// decode. `--secam raw-demod` instead emits the raw demodulated Db/Dr per
+    /// line as chroma, without PAL re-modulation. Omit the flag to leave the
+    /// SECAM chroma untouched.
+    #[arg(long, value_enum, ignore_case = true, num_args = 0..=1, require_equals = true, default_missing_value = "pseudo-pal")]
+    secam: Option<CliSecamMode>,
+    /// Apply SECAM HF (anti-bell) and LF de-emphasis during --secam. Off by
+    /// default; only correct for sources carrying the standard SECAM
+    /// pre-emphasis (it degrades sources, such as many test patterns, that lack it).
+    #[arg(long)]
+    secam_deemphasis: bool,
+    /// FM-discriminator averaging window in samples for --secam; smaller is
+    /// sharper (an invented tuning parameter, not from the SECAM standard).
+    #[arg(long, default_value_t = 5)]
+    secam_disc_window: usize,
+    /// Median window in samples rejecting FM click noise at colour transitions
+    /// during --secam (an invented tuning parameter).
+    #[arg(long, default_value_t = 27)]
+    secam_median_window: usize,
     /// Disable the right-edge hsync zero-crossing refinement.
     #[arg(long)]
     disable_right_hsync: bool,
@@ -389,6 +427,10 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
             .unwrap_or(profile.decode_options.fm_audio_notch),
         rf_disable_dc_offset: !cli.enable_dc_offset,
         disable_comb: cli.no_comb,
+        secam: cli.secam.map(Into::into),
+        secam_deemphasis: cli.secam_deemphasis,
+        secam_disc_window: cli.secam_disc_window,
+        secam_median_window: cli.secam_median_window,
         skip_chroma: cli.chroma_out.is_none(),
         video_nldeemp_enabled: cli.nldeemp,
         subdeemp: cli.subdeemp,

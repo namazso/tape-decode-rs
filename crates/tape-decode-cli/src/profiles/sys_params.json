@@ -202,7 +202,19 @@
     "track_ire0_offset": [
       0.0,
       0.0
-    ]
+    ],
+    "secam": {
+      "sens_ry_hz": 532000.0,
+      "sens_by_hz": 345000.0,
+      "compress_v": 0.877,
+      "compress_u": 0.493,
+      "burst_amplitude": 0.15,
+      "baseband_lpf_hz": 1300000.0,
+      "bell_centre_hz": 4286000.0,
+      "bell_q": 16.0,
+      "lf_deemph_pole_hz": 85000.0,
+      "lf_deemph_k": 3.0
+    }
   },
   "MPAL": {
     "base": "Base525",

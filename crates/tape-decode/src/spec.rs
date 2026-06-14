@@ -11,7 +11,7 @@ use crate::decode::{
 use crate::optimized::narrow_sos;
 use crate::request::{
     BoostRampFilter, ColorSystem, DecodeRequest, DeemphasisParams, FieldOrderAction, LineSystem,
-    NonlinearParams, ShelfKind, VideoLumaFilter, WowInterpolation,
+    NonlinearParams, SecamMode, SecamParams, ShelfKind, VideoLumaFilter, WowInterpolation,
 };
 use crate::vec_utils::convert_vec_in_place;
 
@@ -92,6 +92,17 @@ pub struct DecoderSpec {
     pub(crate) rf_fsc_wave: Vec<(f32, f32)>,
 
     pub(crate) rf_disable_comb: bool,
+    /// SECAM chroma handling, `None` to leave SECAM chroma untouched.
+    pub(crate) rf_secam_mode: Option<SecamMode>,
+    /// Apply the SECAM HF/LF de-emphasis during the SECAM conversion.
+    pub(crate) rf_secam_deemphasis: bool,
+    /// FM-discriminator averaging window (samples) for the SECAM conversion.
+    pub(crate) rf_secam_disc_window: usize,
+    /// Median window (samples) for SECAM transition click-noise rejection.
+    pub(crate) rf_secam_median_window: usize,
+    /// SECAM demod/modulation constants (from sys_params.json); `Some` when a
+    /// SECAM conversion is active.
+    pub(crate) rf_secam_params: Option<SecamParams>,
     pub(crate) rf_disable_right_hsync: bool,
     pub(crate) rf_disable_dc_offset: bool,
     pub(crate) rf_fallback_vsync: bool,
@@ -112,6 +123,18 @@ pub struct DecoderSpec {
     pub(crate) chroma_filter_deemphasis: Option<Vec<Sos<f32>>>,
     pub(crate) chroma_filter_audio_notch: Option<Vec<Sos<f32>>>,
     pub(crate) chroma_filter_final: Vec<Sos<f32>>,
+    /// Baseband low-pass for the recovered colour-difference signals during
+    /// SECAM->pseudo-PAL conversion. `None` unless that conversion is active.
+    pub(crate) chroma_secam_baseband_lpf: Option<Vec<Sos<f32>>>,
+    /// Anti-bell (HF de-emphasis) magnitude response, one gain per field-FFT
+    /// bin, applied to the SECAM subcarrier spectrum before discrimination
+    /// (§3.4 / §5.1 step 2: multiply the spectrum by `|A_ВЧ(f)|⁻¹`). `None`
+    /// unless the SECAM->pseudo-PAL conversion is active.
+    pub(crate) chroma_secam_antibell_gain: Option<Vec<f32>>,
+    /// LF de-emphasis applied to each recovered colour-difference baseband
+    /// (§3.2 / §5.1 step 6: the reciprocal `|A_НЧ(f)|⁻¹` of the transmitter's
+    /// low-frequency pre-emphasis). `None` unless that conversion is active.
+    pub(crate) chroma_secam_lf_deemphasis: Option<Vec<Sos<f32>>>,
 
     pub(crate) video_rf_filter: Vec<f32>,
     pub(crate) video_notch_filter: Option<Vec<f32>>,
@@ -527,6 +550,86 @@ impl DecoderSpec {
 
         // Post-TBC chroma filter at output sample rate (4fsc).
         let chroma_filter_final = chroma_bandpass_final(is_color_under)?;
+
+        // SECAM chroma decoding (only meaningful for SECAM sources). The system
+        // constants come from sys_params.json (`secam` block); a SECAM system
+        // must carry them.
+        let rf_secam_params = sys_params.secam.clone();
+        let rf_secam_mode = if rf_color_system == ColorSystem::Secam {
+            request.secam
+        } else {
+            None
+        };
+        if rf_secam_mode.is_some() && rf_secam_params.is_none() {
+            bail!("--secam requires a `secam` parameter block in sys_params.json for this system");
+        }
+        // The HF/LF de-emphasis (anti-bell + LF) is opt-in: it is correct only
+        // for sources that carry the standard SECAM pre-emphasis.
+        let rf_secam_deemphasis = rf_secam_mode.is_some() && request.secam_deemphasis;
+        // PAL chroma-bandwidth low-pass for the recovered R-Y/B-Y baseband.
+        let chroma_secam_baseband_lpf = match (rf_secam_mode, &rf_secam_params) {
+            (Some(_), Some(secam)) => {
+                let nyquist = sys_params.outfreq * 1e6 / 2.0;
+                Some(butter_sos(
+                    2,
+                    &[secam.baseband_lpf_hz / nyquist],
+                    FilterBandType::Lowpass,
+                )?)
+            }
+            _ => None,
+        };
+        // Anti-bell (HF de-emphasis), §3.4: the receiver-side reciprocal of the
+        // transmitter "cloche", well approximated by a single Q resonator at the
+        // bell centre, N(f) = 1/sqrt(1 + Q^2 [f/f0 - f0/f]^2). It is realised
+        // here as a zero-phase magnitude multiply over the field-FFT bins (§5.1
+        // step 2 describes it literally as "multiply the spectrum by |A_ВЧ|⁻¹"),
+        // so it flattens the transmitted side-component boost without disturbing
+        // the subcarrier's instantaneous phase (hence the recovered frequency).
+        let chroma_secam_antibell_gain = match (rf_secam_deemphasis, &rf_secam_params) {
+            (true, Some(secam)) => {
+                let f0 = secam.bell_centre_hz;
+                let q = secam.bell_q;
+                let fs = out_sample_rate_mhz * 1e6;
+                let n = fieldlen;
+                let gain: Vec<f32> = (0..n)
+                    .map(|i| {
+                        // Only the positive-frequency bins (0..=n/2) are consumed;
+                        // mirror the rest so the table is well-defined throughout.
+                        let bin = i.min(n - i);
+                        let f = bin as f64 * fs / n as f64;
+                        if f <= 0.0 {
+                            0.0
+                        } else {
+                            let big_f = f / f0 - f0 / f;
+                            (1.0 / (1.0 + q * q * big_f * big_f).sqrt()) as f32
+                        }
+                    })
+                    .collect();
+                Some(gain)
+            }
+            _ => None,
+        };
+        // LF de-emphasis, §3.2: reciprocal of the transmitter's first-order HF
+        // pre-emphasis A_НЧ(f) = (1 + jf/f1)/(1 + jf/(k f1)). The de-emphasis
+        // K_НЧ = |A_НЧ|⁻¹ has a zero at k*f1 and a pole at f1: 0 dB at DC,
+        // falling to 20·log10(1/k) dB at HF.
+        let chroma_secam_lf_deemphasis = match (rf_secam_deemphasis, &rf_secam_params) {
+            (true, Some(secam)) => {
+                let f1 = secam.lf_deemph_pole_hz;
+                let k = secam.lf_deemph_k;
+                let fs = out_sample_rate_mhz * 1e6;
+                // Pre-warp the corner frequencies for the bilinear transform.
+                let prewarp = |f: f64| 2.0 * fs * (std::f64::consts::PI * f / fs).tan();
+                let wz = prewarp(k * f1); // numerator zero
+                let wp = prewarp(f1); // denominator pole
+                // Analog H(s) = (1 + s/wz)/(1 + s/wp), descending-power coefficients.
+                let (b, a) = bilinear(&[1.0 / wz, 1.0], &[1.0 / wp, 1.0], fs);
+                // First-order result; pad to a degenerate biquad section.
+                let pad = |v: &[f64]| [v[0], *v.get(1).unwrap_or(&0.0), 0.0];
+                Some(vec![Sos::new(pad(&b), pad(&a))])
+            }
+            _ => None,
+        };
         let (rf_chroma_heterodyne, rf_fsc_wave) = if is_color_under {
             let cc_freq_mhz = color_under / 1e6;
             let het_freq = sys_params.fsc_mhz + cc_freq_mhz;
@@ -632,6 +735,11 @@ impl DecoderSpec {
             dod_hysteresis: request.dod_hysteresis,
 
             rf_disable_comb,
+            rf_secam_mode,
+            rf_secam_deemphasis,
+            rf_secam_disc_window: request.secam_disc_window,
+            rf_secam_median_window: request.secam_median_window,
+            rf_secam_params,
             rf_disable_right_hsync: request.rf_disable_right_hsync,
             rf_disable_dc_offset: request.rf_disable_dc_offset,
             rf_fallback_vsync,
@@ -652,6 +760,9 @@ impl DecoderSpec {
             chroma_filter_deemphasis: chroma_filter_deemphasis.map(store_sos_filter),
             chroma_filter_audio_notch: chroma_filter_audio_notch.map(store_sos_filter),
             chroma_filter_final: store_sos_filter(chroma_filter_final),
+            chroma_secam_baseband_lpf: chroma_secam_baseband_lpf.map(store_sos_filter),
+            chroma_secam_antibell_gain,
+            chroma_secam_lf_deemphasis: chroma_secam_lf_deemphasis.map(store_sos_filter),
 
             video_rf_filter: store_real_filter(video_rf_filter),
             video_notch_filter: video_notch_filter.map(store_real_filter),

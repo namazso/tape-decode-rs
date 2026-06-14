@@ -17,6 +17,48 @@ pub enum FieldOrderAction {
     None,
 }
 
+/// How SECAM chroma is handled when `--secam` is given (otherwise the chroma is
+/// left untouched).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub enum SecamMode {
+    /// FM-demodulate the SECAM subcarrier and re-modulate the recovered
+    /// colour-difference signals as a balanced (suppressed-carrier) pseudo-PAL
+    /// composite that a standard PAL chroma decoder can demodulate.
+    PseudoPal,
+    /// Emit the raw demodulated, line-alternating colour-difference baseband
+    /// (Dr/Db) directly as the chroma signal, without re-modulating it onto a
+    /// PAL subcarrier. For inspecting the demodulator output.
+    RawDemod,
+}
+
+/// SECAM demodulation/modulation constants drawn from the SECAM/PAL standards
+/// (see `tmp/secam-to-pal.md`). Carried per-system in `sys_params.json`; present
+/// only for SECAM systems.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SecamParams {
+    /// R-Y FM sensitivity (Hz): `E'_{R-Y} = -Δf / sens_ry_hz` (§5.1, 532 kHz).
+    pub sens_ry_hz: f64,
+    /// B-Y FM sensitivity (Hz): `E'_{B-Y} = +Δf / sens_by_hz` (§5.1, 345 kHz).
+    pub sens_by_hz: f64,
+    /// PAL compression of V (R-Y): `V = compress_v · E'_{R-Y}` (§4.1, 0.877).
+    pub compress_v: f32,
+    /// PAL compression of U (B-Y): `U = compress_u · E'_{B-Y}` (§4.1, 0.493).
+    pub compress_u: f32,
+    /// Pseudo-PAL swinging-burst amplitude (§4.5, 0.15). Only the
+    /// chroma-to-burst ratio survives the later burst normalization.
+    pub burst_amplitude: f32,
+    /// Recovered-baseband low-pass cutoff (Hz): PAL chroma bandwidth (§4.1, 1.3 MHz).
+    pub baseband_lpf_hz: f64,
+    /// Anti-bell (HF de-emphasis) resonator centre (Hz) (§3.4, 4.286 MHz).
+    pub bell_centre_hz: f64,
+    /// Anti-bell resonator quality factor (§3.4, 16).
+    pub bell_q: f64,
+    /// LF de-emphasis first-order pole (Hz) (§3.2, 85 kHz); zero at `k·pole`.
+    pub lf_deemph_pole_hz: f64,
+    /// LF de-emphasis zero/pole ratio `k` (§3.2, 3).
+    pub lf_deemph_k: f64,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct DecodeOptions {
@@ -138,6 +180,9 @@ pub struct SysParams {
     pub burst_abs_ref: Option<f32>,
     pub track_ire0_offset: [f64; 2],
     pub nonlinear_deviation: Option<f32>,
+    /// SECAM demodulation/modulation constants; present only for SECAM systems.
+    #[serde(default)]
+    pub secam: Option<SecamParams>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -260,6 +305,14 @@ pub enum VideoLumaFilter {
     },
 }
 
+fn default_secam_disc_window() -> usize {
+    5
+}
+
+fn default_secam_median_window() -> usize {
+    27
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct DecodeRequest {
     pub inputfreq: f64,
@@ -278,6 +331,23 @@ pub struct DecodeRequest {
     pub fm_audio_notch: f64,
     pub rf_disable_dc_offset: bool,
     pub disable_comb: bool,
+    /// SECAM chroma handling. `None` leaves the chroma untouched.
+    #[serde(default)]
+    pub secam: Option<SecamMode>,
+    /// Apply the SECAM HF (anti-bell, §3.4) and LF (§3.2) de-emphasis during the
+    /// SECAM conversion. Only meaningful when `secam` is set. Off by default: it
+    /// is correct only for sources that carry the standard SECAM pre-emphasis,
+    /// and degrades sources (e.g. many test patterns) that do not.
+    #[serde(default)]
+    pub secam_deemphasis: bool,
+    /// FM-discriminator averaging window (samples) for the SECAM conversion;
+    /// smaller is sharper. An invented tuning parameter, not from the standard.
+    #[serde(default = "default_secam_disc_window")]
+    pub secam_disc_window: usize,
+    /// Median window (samples) that rejects FM click noise at colour transitions
+    /// during the SECAM conversion. An invented tuning parameter.
+    #[serde(default = "default_secam_median_window")]
+    pub secam_median_window: usize,
     pub skip_chroma: bool,
     pub video_nldeemp_enabled: bool,
     pub subdeemp: bool,
