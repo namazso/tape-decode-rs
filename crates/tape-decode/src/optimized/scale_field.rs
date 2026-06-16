@@ -298,6 +298,12 @@ fn scale_field_linear(
             } else {
                 raw_adjust
             };
+            // Clamp the source position into the interior so the 4-tap window
+            // stays in bounds. Valid fields never reach the edge, so this is a
+            // no-op for normal output; it only catches degenerate line locations
+            // that would otherwise underflow `coord_int - 1`. `.max().min()`
+            // (not `clamp`) also folds a NaN coordinate to the low edge.
+            let coord = coord.max(1.0).min((buf.len() - 3) as f64);
             let coord_int = coord as usize;
             let w = &buf[coord_int - 1..coord_int + 3];
             let x = (coord - coord_int as f64) as f32;
@@ -370,15 +376,17 @@ fn scale_span_simd(
         } else {
             raw.cast()
         };
-        // Establish the tap window bounds in the float domain (a NaN coordinate
-        // fails the comparison and panics here too), which licenses the direct
-        // truncating conversion and the unchecked gathers below: the saturating
-        // cast and per-lane bounds masks otherwise scalarize the index setup.
-        assert!(
-            coord.reduce_min() >= 1.0 && coord.reduce_max() + 3.0 <= buf.len() as f64,
-            "wow coordinate outside the field buffer"
-        );
-        // SAFETY: every lane is within [1.0, buf.len() - 3.0] per the assert.
+        // Clamp the tap window bounds into the interior in the float domain,
+        // mirroring the scalar paths: valid fields never reach the edge, so this
+        // is a no-op for normal output and only catches degenerate line
+        // locations. `simd_max`/`simd_min` (IEEE maxnum/minnum) also fold a NaN
+        // coordinate to the low edge. This establishes the [1.0, buf.len() - 3.0]
+        // range by construction, which licenses the direct truncating conversion
+        // and the unchecked gathers below.
+        let coord = coord
+            .simd_max(Simd::splat(1.0))
+            .simd_min(Simd::splat((buf.len() - 3) as f64));
+        // SAFETY: every lane is within [1.0, buf.len() - 3.0] per the clamp above.
         let ci: Simd<usize, LANES> = unsafe { coord.to_int_unchecked::<isize>() }.cast();
         let frac: Simd<f32, LANES> = (coord - ci.cast::<f64>()).cast();
         let yes = Mask::splat(true);
@@ -498,6 +506,12 @@ fn scale_field_k<const K: usize>(
         } else {
             raw_adjust
         };
+        // Clamp the source position into the interior so the 4-tap window stays
+        // in bounds. Valid fields never reach the edge, so this is a no-op for
+        // normal output; it only catches degenerate line locations that would
+        // otherwise underflow `coord_int - 1`. `.max().min()` (not `clamp`) also
+        // folds a NaN coordinate to the low edge.
+        let coord = coord.max(1.0).min((buf.len() - 3) as f64);
         let coord_int = coord as usize;
 
         let w = &buf[coord_int - 1..coord_int + 3];
