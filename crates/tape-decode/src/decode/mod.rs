@@ -793,9 +793,6 @@ struct DecodedField {
     /// The levels the field's line locations were refined with.
     levels: VideoLevels,
     burst_lock: Option<BurstLock>,
-    /// The chroma track phase the burst lock read this field with, which
-    /// selects the track IRE0 offset.
-    track_phase: Option<i64>,
     /// The color-under carrier the chroma is heterodyned at, in Hz: measured
     /// from the field under chroma AFC, otherwise the format's nominal one.
     chroma_carrier: f64,
@@ -1425,9 +1422,6 @@ impl Decoder {
                                         hz_ire = field_obj.levels.hz_ire;
                                     }
                                 }
-                            }
-                            if let Some(track_phase) = field_obj.track_phase {
-                                ire0 += self.spec.sys_track_ire0_offset[track_phase as usize];
                             }
                             picture_luma = Some(LumaOutput::Encoded(hz_to_output_array(
                                 &self.spec,

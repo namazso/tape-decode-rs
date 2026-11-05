@@ -713,9 +713,6 @@
       }
     }
   },
-  "VHSHQ": {
-    "base": "VHS"
-  },
   "VIDEO2000": {
     "decoder_params": {
       "boost_bpf": null,

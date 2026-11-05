@@ -37,10 +37,6 @@
     "num_pulses": 5,
     "outlinelen": 1135,
     "output_zero": 256,
-    "track_ire0_offset": [
-      0.0,
-      0.0
-    ],
     "vsync_pulse_us": 40.0,
     "vsync_ire": -42.857142857142854
   },
@@ -92,10 +88,6 @@
     "nonlinear_deviation": null,
     "num_pulses": 6,
     "output_zero": 1024,
-    "track_ire0_offset": [
-      0.0,
-      0.0
-    ],
     "vsync_pulse_us": 27.1,
     "vsync_ire": -40.0
   },
@@ -173,10 +165,6 @@
     "num_pulses": 5,
     "outlinelen": 1135,
     "output_zero": 256,
-    "track_ire0_offset": [
-      0.0,
-      0.0
-    ],
     "vsync_pulse_us": 24.4,
     "vsync_ire": -42.857142857142854
   },
@@ -217,11 +205,7 @@
     "fsc_mhz": 4.43361875,
     "hz_ire": 7000.0,
     "ire0": 4100000.0,
-    "nonlinear_deviation": null,
-    "track_ire0_offset": [
-      0.0,
-      0.0
-    ]
+    "nonlinear_deviation": null
   },
   "SECAM": {
     "base": "PAL",

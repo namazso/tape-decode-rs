@@ -104,7 +104,6 @@ pub struct DecoderSpec {
     pub(crate) sys_outlinelen: usize,
     pub(crate) sys_ld_vits_whitelocs: Vec<[usize; 3]>,
     pub(crate) sys_burst_abs_ref: Option<f32>,
-    pub(crate) sys_track_ire0_offset: [f32; 2],
 
     pub(crate) decoder_color_under_carrier: f64,
     pub(crate) decoder_chroma_conversion_lo: Option<f64>,
@@ -836,7 +835,6 @@ impl DecoderSpec {
             sys_outlinelen: sys_params.outlinelen,
             sys_ld_vits_whitelocs: sys_params.ld_vits_whitelocs.clone(),
             sys_burst_abs_ref: sys_params.burst_abs_ref,
-            sys_track_ire0_offset: sys_params.track_ire0_offset,
 
             decoder_color_under_carrier: decoder_params.color_under_carrier,
             decoder_chroma_conversion_lo: conversion_lo,

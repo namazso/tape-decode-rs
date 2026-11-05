@@ -426,8 +426,8 @@ fn get_phase_sequence(
 
 /// Locks the heterodyne to the field's bursts starting from the chroma
 /// track phase `start_index`, checking that index against the burst phase
-/// steps between lines. Returns the index the field was read with, the one
-/// the next field starts from, and the lock.
+/// steps between lines. Returns the index the next field starts from and the
+/// lock.
 fn get_phase_rotation_sequence(
     spec: &DecoderSpec,
     field: &DecodedField,
@@ -436,7 +436,7 @@ fn get_phase_rotation_sequence(
     start_index: i64,
     burst_area: (usize, usize),
     prev_burst_start_line: i64,
-) -> (i64, i64, BurstLock) {
+) -> (i64, BurstLock) {
     const TRACK_CHANGE_THRESHOLD: f32 = 90.0;
     const BURST_CHECK_SKIP_LINES: isize = 16;
     // Field-average burst magnitude below which the color killer blanks the
@@ -447,7 +447,6 @@ fn get_phase_rotation_sequence(
     let end = field.output_lines().end;
     let chroma_rotation = spec.decoder_chroma_rotation.map(|v| (v[0], v[1]));
     let is_ntsc = spec.color_system == ColorSystem::Ntsc;
-    let mut start_index = start_index;
     let (mut next_index, mut phase_sequence) = get_phase_sequence(
         spec,
         field,
@@ -486,13 +485,12 @@ fn get_phase_rotation_sequence(
     };
 
     if flip_track_phase {
-        start_index = next_index;
         (next_index, phase_sequence) = get_phase_sequence(
             spec,
             field,
             chroma,
             chroma_heterodyne,
-            start_index,
+            next_index,
             burst_area,
             TRACK_CHANGE_THRESHOLD,
         );
@@ -532,7 +530,6 @@ fn get_phase_rotation_sequence(
     }
 
     (
-        start_index,
         next_index,
         BurstLock {
             phase_sequence,
@@ -735,7 +732,7 @@ fn apply_burst_lock(
             Some(burst_start + burst_end),
         )
     };
-    let (track_phase, next_track_phase, burst_lock) = get_phase_rotation_sequence(
+    let (next_track_phase, burst_lock) = get_phase_rotation_sequence(
         spec,
         field,
         &chroma,
@@ -745,7 +742,6 @@ fn apply_burst_lock(
         prev_burst_start_line,
     );
     inter_field_state.track_phase = next_track_phase;
-    field.track_phase = Some(track_phase);
     field.burst_lock = Some(burst_lock);
 }
 
@@ -788,7 +784,6 @@ pub(crate) fn predecode_field_from_rawdecode(
         valid: false,
         levels: inter_field_state.levels,
         burst_lock: None,
-        track_phase: None,
         chroma_carrier: spec.decoder_color_under_carrier,
         chroma_heterodyne: None,
         wow_analysis: None,
