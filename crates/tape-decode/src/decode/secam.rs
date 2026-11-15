@@ -1,559 +1,410 @@
-//! SECAM method 1 colour-under restoration. The recorder passed the studio
-//! chroma block through a divide-by-4 counter, so the rest carriers on tape
-//! are foB/4 and foR/4 with the FM deviation divided by four as well, and
-//! the block is restored by multiplying the carrier phase back up rather
-//! than by mixing against a heterodyne. Carrier and deviation scale
-//! together, so tape timebase error self-corrects and there is no
-//! conversion LO to servo. The divider output has constant amplitude, so
-//! the BT.470 bell pre-emphasis is regenerated from the restored
-//! instantaneous frequency.
+//! SECAM method 1 colour-under restoration. The recorder took the bell
+//! pre-emphasis off the studio chroma block, passed the block through a
+//! divide-by-4 counter and put a bell pre-emphasis of its own on the result,
+//! so the tape holds rest carriers at foB/4 and foR/4 with the FM deviation
+//! divided by four as well, under an anti-bell centred between them.
+//! Playback mirrors the recorder stage by stage: the bell that undoes the
+//! tape's anti-bell, a limiter, the carrier phase multiplied back up, and the
+//! BT.470 anti-bell on the restored block. Carrier and deviation scale
+//! together, so tape timebase error self-corrects and there is no conversion
+//! LO to servo.
+//!
+//! The line blanking is then rewritten with the rest carrier, because what
+//! the tape holds there is the divider settling after the blanking edge
+//! rather than the rest carrier the decoders downstream zero their
+//! discriminators on.
 
 use std::f64::consts::{PI, TAU};
-use std::ops::{Range, RangeInclusive};
 
+use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex64;
+use rustfft::FftPlanner;
 
-use super::chroma::{analytic_signal, phase_step};
 use super::*;
+use crate::spec::{next_fast_len, sosfiltfft};
 
-/// Subcarrier rest frequencies (ITU-R BT.470).
-const FOR_HZ: f32 = 4_406_250.0;
-const FOB_HZ: f32 = 4_250_000.0;
-/// Largest legal deviation below foB and above foR (BT.470-6 table 2 item
-/// 2.12): the per-component maxima (D'B -350/+506 kHz, D'R -506/+350 kHz)
-/// mirror across the carrier pair, so both components share the one
-/// corridor foB - 350 kHz to foR + 350 kHz.
-const MAX_DEVIATION_HZ: f32 = 350e3;
-/// Centre of the HF pre-emphasis bell.
-const BELL_F0_HZ: f32 = 4_286_000.0;
-/// Legal subcarrier excursion; the bell gain is looked up inside it so that
-/// noise and carrier switch transients are not boosted by the bell skirts.
-const CARRIER_RANGE_HZ: RangeInclusive<f32> = 3.9e6..=4.756e6;
-/// Taps of the moving average over the instantaneous frequency, so that
-/// sample-level phase noise does not end up as amplitude noise through the
-/// bell (which is smooth enough not to be blunted by it).
-const INST_FREQ_SMOOTHING: usize = 9;
-/// Envelope ceiling relative to the field median.
-const ENVELOPE_CAP: f32 = 1.25;
-/// First line with chroma output.
-const STARTING_LINE: usize = 16;
-/// Lines needed to fit the line alternation, and the fraction of them that
-/// must agree with the fit before the blanking is regenerated from it.
-const IDENT_MIN_LINES: usize = 32;
-const IDENT_MIN_CONFIDENCE: f32 = 0.7;
+/// Centre of the HF pre-emphasis of the chroma block (ITU-R BT.470); the
+/// tape's own pre-emphasis sits at the same place counted down.
+const BELL_F0_HZ: f64 = 4_286_000.0;
+/// Carrier envelope, relative to the field median, the limiter starts at.
+/// Below it the amplitude passes through, so a carrier that collapses
+/// (dropouts, no colour) reaches the downstream colour killers as a collapse
+/// rather than as full-scale noise.
+const LIMITER_KNEE: f32 = 0.5;
+/// Rest carriers of the D'R and D'B lines (ITU-R BT.470).
+const REST_HZ: [f64; 2] = [4_406_250.0, 4_250_000.0];
 
-/// Relative subcarrier HF pre-emphasis (bell) gain at `freq_hz`, unity at
-/// the bell centre: |1 + j16F| / |1 + j1.26F| with F = f/f0 - f0/f.
-fn bell_gain(freq_hz: f32) -> f32 {
-    let f = freq_hz / BELL_F0_HZ;
-    let bell_f = f - 1.0 / f;
-    ((1.0 + (16.0 * bell_f).powi(2)) / (1.0 + (1.26 * bell_f).powi(2))).sqrt()
+/// The blanking splice opens this long before the active video ends, ahead
+/// of what the block band spreads back from the blanking edge.
+const SPLICE_LEAD_US: f64 = 0.85;
+/// The synthesized carrier fades in over the outgoing one for this long
+/// before the splice opens.
+const FADE_US: f64 = 0.45;
+/// Glide from the outgoing carrier's frequency to its line's rest carrier.
+const RAMP_US: f64 = 1.13;
+/// Carrier measurement window on either side of the splice.
+const MEASURE_US: f64 = 1.8;
+/// Step from one line's rest carrier to the next's, from the incoming line's
+/// start: over the sync tip.
+const STEP_US: [f64; 2] = [0.45, 2.26];
+/// Frequency excursion closing the phase between the two lines' carriers,
+/// from the incoming line's start. It ends with the sync pulse, so the back
+/// porch holds the bare rest carrier.
+const BUMP_US: [f64; 2] = [-0.9, 4.96];
+const BUMP_TAPER_US: f64 = 0.68;
+/// Largest excursion the closure may need, for any phase between the lines.
+const BUMP_MAX_HZ: f64 = 350e3;
+/// Back porch stretch the line alternation is read from, counted back from
+/// the active video start.
+const PORCH_US: [f64; 2] = [3.7, 0.3];
+
+/// HF pre-emphasis (anti-bell) network centred on `f0` at `freq_hz`:
+/// (1 + j16F) / (1 + j1.26F) with F = f/f0 - f0/f (BT.470-6 table 2 item
+/// 2.13). Its inverse is the bell.
+fn anti_bell(freq_hz: f64, f0: f64) -> Complex64 {
+    let bell_f = freq_hz / f0 - f0 / freq_hz;
+    Complex64::new(1.0, 16.0 * bell_f) / Complex64::new(1.0, 1.26 * bell_f)
 }
 
-/// Wrap to (-pi, pi].
-fn wrap_phase(phase: f64) -> f64 {
-    phase.sin().atan2(phase.cos())
-}
-
-/// One restoration pass over a field.
-struct Upconverted {
-    /// The restored chroma block.
-    signal: Vec<f32>,
-    /// Smoothed restored-domain instantaneous frequency in Hz the bell was
-    /// shaped with; reused for the line identification.
-    inst_freq: Vec<f32>,
-    /// Band-passed under-carrier envelope.
-    envelope: Vec<f32>,
-}
-
-/// Restore the chroma block from the colour-under `chroma` by multiplying
-/// the under carrier's phase by `mult`, with the bell amplitude regenerated
-/// from the restored instantaneous frequency. `rest_amplitude` is the peak
-/// amplitude of the undeviated carrier.
-fn upconvert(chroma: &[f32], spec: &DecoderSpec, mult: u32, rest_amplitude: f32) -> Upconverted {
-    let under_filter = spec
-        .secam_under_filter
-        .as_ref()
-        .expect("SECAM method 1 spec without its under band-pass");
-    let fft = spec
-        .secam_analytic_fft
-        .as_ref()
-        .expect("SECAM method 1 spec without its analytic transform");
-    let filtered = sosfiltfilt_f32(under_filter, chroma);
-    // Over the whole field, so short-window edge effects do not bias the
-    // phase.
-    let analytic = analytic_signal(&filtered, fft);
-    let envelope: Vec<f32> = analytic
-        .iter()
-        .map(|z| z.re.mul_add(z.re, z.im * z.im).sqrt())
-        .collect();
-    let samp_rate = spec.tbc_sample_rate();
-
-    // Under-carrier phase advance per sample, as the central difference of
-    // the unwrapped phase (one-sided at the ends), clamped to the legal
-    // corridor ahead of the multiplication: the studio limiter clipped the
-    // colour difference to these bounds, so anything outside is noise or a
-    // tape channel truncation transient, which the multiplication would
-    // scale up and the downstream de-emphasis smear into streaks at
-    // saturated transitions. Clipping the instantaneous frequency and
-    // re-integrating keeps the carrier smooth, with the clipped spans as
-    // constant-frequency stretches; the absolute phase is lost, which the FM
-    // decoders downstream do not care about. The clamped steps are f64: the
-    // corridor edge rounded to f32 would bias the thousands of clamped
-    // samples of a field alike. The integral is kept reduced to a turn,
-    // which every clamped step is well under.
-    //
-    // The restored-domain instantaneous frequency for the bell is the central
-    // difference of the re-integrated phase, whose consecutive samples differ
-    // by the clamped steps from the second one on. Both come out of one pass
-    // over the analytic signal that carries the previous raw and clamped
-    // steps, so no field-sized f64 buffer is needed.
-    let step_per_hz = TAU / samp_rate;
-    let corridor = f64::from(FOB_HZ - MAX_DEVIATION_HZ) / f64::from(mult) * step_per_hz
-        ..=f64::from(FOR_HZ + MAX_DEVIATION_HZ) / f64::from(mult) * step_per_hz;
-    let freq_scale = f64::from(mult) / step_per_hz;
-    let n = analytic.len();
-    assert!(n >= 2, "a field has more than one sample");
-    let mut phase = Vec::with_capacity(n);
-    let mut raw_freq = Vec::with_capacity(n);
-    let mut integral = 0.0f64;
-    let mut prev_raw = None;
-    let mut prev_step = 0.0f64;
-    for k in 0..n {
-        let raw = analytic.get(k + 1).map(|&next| phase_step(analytic[k], next));
-        let centered = match (prev_raw, raw) {
-            (Some(before), Some(after)) => (before + after) / 2.0,
-            (None, Some(after)) => after,
-            (Some(before), None) => before,
-            (None, None) => unreachable!(),
-        };
-        let step = f64::from(centered).clamp(*corridor.start(), *corridor.end());
-        integral += f64::from(mult) * step;
-        if integral >= TAU {
-            integral -= TAU;
-        }
-        phase.push(integral as f32);
-        match k {
-            0 => {}
-            1 => raw_freq.push((step * freq_scale) as f32),
-            _ => raw_freq.push(((prev_step + step) / 2.0 * freq_scale) as f32),
-        }
-        prev_raw = raw;
-        prev_step = step;
-    }
-    raw_freq.push((prev_step * freq_scale) as f32);
-    let mut inst_freq = boxcar_same(&raw_freq, INST_FREQ_SMOOTHING);
-    for freq in &mut inst_freq {
-        *freq = freq.clamp(*CARRIER_RANGE_HZ.start(), *CARRIER_RANGE_HZ.end());
-    }
-
-    // Scale by the normalized envelope, capped just above nominal: where the
-    // carrier is healthy this is about unity and the amplitude stays on the
-    // bell; where it dips or disappears (dropouts, FM clicks, no colour) the
-    // dip passes through to the output instead of being limited away, since
-    // downstream SECAM decoders key their concealment off exactly those
-    // collapses, and carrier-free noise does not become full-scale splatter.
-    let env_median = median_radix(&envelope);
-    let signal: Vec<f32> = envelope
-        .iter()
-        .zip(&inst_freq)
-        .zip(&phase)
-        .map(|((&amplitude, &freq), &phase)| {
-            if env_median <= 0.0 {
-                return 0.0;
-            }
-            let limited = (amplitude / env_median).min(ENVELOPE_CAP);
-            rest_amplitude * bell_gain(freq) * limited * phase.cos()
-        })
-        .collect();
-    Upconverted {
-        signal,
-        inst_freq,
-        envelope,
-    }
-}
-
-struct LineAlternation {
-    dr_on_even: bool,
-    /// Fraction of lines agreeing with the fit.
-    confidence: f32,
-}
-
-/// Fit the field's D'R/D'B line alternation from each line's median restored
-/// frequency over the active region: D'R lines sit in the top half of the
-/// chroma block, D'B lines in the bottom. The sequence alternates strictly,
-/// so the better of the two parities is fitted; a heavily saturated line can
-/// land on the wrong side, the majority never does. `None` with too few
-/// lines to fit.
-fn fit_line_alternation(
-    inst_freq: &[f32],
-    outwidth: usize,
-    first_line: usize,
-    porch_end_px: usize,
-) -> Option<LineAlternation> {
-    let linesout = inst_freq.len() / outwidth;
-    let n_lines = linesout
-        .checked_sub(first_line)
-        .filter(|&n| n >= IDENT_MIN_LINES)?;
-    let active = porch_end_px + 30..outwidth - 40;
-    let even_is_dr = (first_line..linesout)
-        .filter(|&line| {
-            let mut window = inst_freq[line * outwidth..][active.clone()].to_vec();
-            let is_dr = median_from_values(&mut window) > (FOR_HZ + FOB_HZ) / 2.0;
-            is_dr == (line % 2 == 0)
-        })
-        .count();
-    let odd_is_dr = n_lines - even_is_dr;
-    Some(LineAlternation {
-        dr_on_even: even_is_dr >= odd_is_dr,
-        confidence: even_is_dr.max(odd_is_dr) as f32 / n_lines as f32,
-    })
-}
-
-/// Narrowband model of the colour-under carrier over a short window,
-/// measured by correlation against a rotor at the line's rest frequency:
-/// the two half-window correlations give the frequency offset from the
-/// rotor, their sum the phase. Correlation projects out everything away
-/// from the rotor, so it is usable on the raw chroma, where luma crosstalk
-/// would bias a broadband measurement.
-struct CarrierModel {
-    freq: f64,
-    /// Rotor phase advance per sample.
-    rotor_step: f64,
-    /// Phase advance per sample of the offset from the rotor.
-    offset_step: f64,
-    /// Phase at the window centre `t_mid`.
-    phase_mid: f64,
-    t_mid: f64,
-}
-
-impl CarrierModel {
-    /// Carrier phase at absolute sample `t`.
-    fn phase_at(&self, t: f64) -> f64 {
-        self.rotor_step * t + self.phase_mid + self.offset_step * (t - self.t_mid)
-    }
-}
-
-fn measure_carrier(
-    chroma: &[f32],
-    samp_rate: f64,
-    start: usize,
-    len: usize,
-    f_rot: f64,
-) -> Option<CarrierModel> {
-    // Keep runaway estimates (no real carrier in the window) inside the
-    // format's legal deviation.
-    const MAX_OFFSET_HZ: f64 = 130e3;
-
-    let window = chroma.get(start..start + len)?;
-    let rotor_step = TAU * f_rot / samp_rate;
-    let correlate = |samples: &[f32], t0: usize| -> Complex64 {
-        // The rotor is walked from the window start rather than evaluated
-        // per sample.
-        let mut rotor = Complex64::from_polar(1.0, -rotor_step * t0 as f64);
-        let advance = Complex64::from_polar(1.0, -rotor_step);
-        let mut sum = Complex64::new(0.0, 0.0);
-        for &x in samples {
-            sum += rotor * f64::from(x);
-            rotor *= advance;
-        }
-        sum
-    };
-    let half = len / 2;
-    let z1 = correlate(&window[..half], start);
-    let z2 = correlate(&window[half..], start + half);
-    let zf = z1 + z2;
-    if z1.norm() == 0.0 || z2.norm() == 0.0 || zf.norm() == 0.0 {
-        return None;
-    }
-    let dphi = (z2 * z1.conj()).arg();
-    let df = (dphi / (TAU * half as f64 / samp_rate)).clamp(-MAX_OFFSET_HZ, MAX_OFFSET_HZ);
-    Some(CarrierModel {
-        freq: f_rot + df,
-        rotor_step,
-        offset_step: TAU * df / samp_rate,
-        phase_mid: zf.arg(),
-        t_mid: start as f64 + (len - 1) as f64 / 2.0,
-    })
-}
-
-/// Samples the synthesized carrier is faded in over, ahead of the splice.
-const FADE_LEN: usize = 8;
-/// Raised-cosine ramp from the measured outgoing carrier to its rest
-/// frequency.
-const RAMP_LEN: usize = 20;
-/// Carrier measurement window on either side of the blanking interval.
-const MEAS_LEN: usize = 32;
-/// Rest-to-rest frequency step, in samples from the next line's start: over
-/// the sync tip.
-const STEP_PX: Range<usize> = 8..40;
-/// Phase closure bump: the outgoing and incoming carriers are independent
-/// oscillator segments, so the synthesis must absorb a uniformly random
-/// phase difference of up to +-pi (times the multiplier after the
-/// restoration, so a step is not an option anywhere near the picture or the
-/// porch). It goes into a cosine-tapered flat-top frequency excursion across
-/// the sync region, sized to the error but capped inside the under
-/// band-pass (BUMP_MAX_HZ around either rest carrier stays within its pass
-/// band), and finished early enough (BUMP_END_PX into the next line) that
-/// the band-pass ring stays out of the porch reference window.
-const BUMP_END_PX: usize = 88;
-const BUMP_MAX_HZ: f64 = 170e3;
-const BUMP_TAPER: usize = 12;
-
-/// Raised cosine rising from 0 towards 1 over `len` samples.
-fn raised_cosine(len: usize) -> Vec<f64> {
-    (0..len)
-        .map(|k| 0.5 - 0.5 * (PI * k as f64 / len as f64).cos())
-        .collect()
-}
-
-/// Phase at each sample of a frequency profile integrated from `phase0`,
-/// and the phase one sample past its end.
-fn integrate_phase(profile: &[f64], phase0: f64, samp_rate: f64) -> (Vec<f64>, f64) {
-    let mut phase = Vec::with_capacity(profile.len());
-    let mut acc = phase0;
-    for &freq in profile {
-        phase.push(acc);
-        acc += TAU * freq / samp_rate;
-    }
-    (phase, acc)
-}
-
-/// Layout of one synthesized blanking interval, in samples from the splice
-/// start; every line shares it.
-struct BlankingLayout {
-    /// Splice start to the next line's porch end.
-    span: usize,
-    /// Rest-to-rest frequency step.
-    step: Range<usize>,
-    /// Phase closure bump.
-    bump: Range<usize>,
-    /// Rest frequency hold after the bump, taking the bump's spill.
-    hold: Range<usize>,
-}
-
-impl BlankingLayout {
-    /// `None` when the interval is too short to fit the synthesis.
-    fn new(outwidth: usize, blank_start_px: usize, porch_end_px: usize) -> Option<Self> {
-        let next_line = outwidth.checked_sub(blank_start_px)?;
-        let span = next_line + porch_end_px;
-        let step0 = (next_line + STEP_PX.start)
-            .max(RAMP_LEN)
-            .min(span.checked_sub(RAMP_LEN + 96)?);
-        // The bump starts no earlier than just before the next line (its
-        // band-pass ring must stay out of the outgoing picture).
-        let bump0 = (RAMP_LEN + 4).max(next_line.saturating_sub(16));
-        let bump1 = (next_line + BUMP_END_PX).min(span.checked_sub(RAMP_LEN + 4)?);
-        let hold = bump1..span - RAMP_LEN;
-        if bump1.checked_sub(bump0)? < 2 * BUMP_TAPER + 8 || hold.len() < 24 {
-            return None;
-        }
-        Some(Self {
-            span,
-            step: step0..step0 + STEP_PX.len(),
-            bump: bump0..bump1,
-            hold,
-        })
-    }
-}
-
-/// Replace each line's blanking interval (front porch, sync and back porch
-/// in one run, from `blank_start_px` to the next line's `porch_end_px`) with
-/// a synthesized undeviated rest carrier, phase-continuous with the active
-/// video on both sides. What comes off tape there is the record divider's
-/// settling transient (blanking edges and subcarrier phase reversals upset
-/// it), which the zero-phase filtering here and downstream would smear
-/// backwards into the last microseconds of the picture (a magenta band down
-/// the right edge) and into the back porch decoders calibrate their
-/// discriminator zeros from (a colour cast). This runs in the colour-under
-/// domain ahead of the second restoration pass, so the filters never see
-/// the transient.
-///
-/// The synthesized frequency ramps from the measured outgoing carrier to the
-/// outgoing line's rest frequency over the front porch, steps to the
-/// incoming line's rest frequency over the sync tip and holds it right
-/// through the back porch, which is the decoders' discriminator zero
-/// reference, up to the incoming picture; being zero colour difference, it
-/// decodes the incoming line's colour turn-on strip as neutral rather than
-/// as a per-line click. The phase is the profile's integral, with the random
-/// phase difference between the two lines' carriers closed by the bump. The
-/// write starts `FADE_LEN` samples early, faded in over the phase-matched
-/// outgoing carrier before the transient sets in; the incoming side gets no
-/// fade, the phase-closed synthesis hands over to the raw signal at the
-/// porch end (a fade over the porch tail mixes transient back in next to the
-/// porch measurement window, one over the picture leaves a seam that rings
-/// down the left edge).
-fn regenerate_blanking(
-    chroma: &[f32],
-    envelope: &[f32],
-    samp_rate: f64,
-    outwidth: usize,
-    layout: &BlankingLayout,
-    blank_start_px: usize,
-    first_line: usize,
-    dr_on_even: bool,
+/// The playback chain over a whole field, in the spectrum of the field
+/// zero-padded to a fast transform length. Both networks are applied as the
+/// complex responses of the analog circuits rather than as zero-phase gains:
+/// the bell has to take the phase of the recorder's anti-bell back out along
+/// with its amplitude, and the anti-bell has to hand the downstream bell the
+/// phase it will take out.
+pub(crate) struct Method1Playback {
+    r2c: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn Fft<f32>>,
+    forward: Arc<dyn Fft<f32>>,
+    c2r: Arc<dyn ComplexToReal<f32>>,
+    /// Per unique bin: the bell around the under carriers, doubled into the
+    /// analytic signal.
+    bell: Vec<Complex32>,
+    /// Per unique bin: the anti-bell within the block band, scaled to the
+    /// output amplitude through the transform pair.
+    anti_bell: Vec<Complex32>,
     mult: u32,
-) -> Vec<f32> {
-    let linesout = chroma.len() / outwidth;
-    let rest_hz = |is_dr: bool| f64::from(if is_dr { FOR_HZ } else { FOB_HZ }) / f64::from(mult);
-    let fade = raised_cosine(FADE_LEN);
-    let ramp = raised_cosine(RAMP_LEN);
-    let step = raised_cosine(layout.step.len());
-    // The bump's shape over its span; its sum is the area a unit amplitude
-    // sweeps.
-    let taper = raised_cosine(BUMP_TAPER);
-    let bump_len = layout.bump.len();
-    let bump: Vec<f64> = (0..bump_len)
-        .map(|k| {
-            if k < BUMP_TAPER {
-                taper[k]
-            } else if k >= bump_len - BUMP_TAPER {
-                taper[bump_len - 1 - k]
+    blanking: Blanking,
+}
+
+impl Method1Playback {
+    /// For fields of up to `len` samples at `samp_rate`, of a carrier counted
+    /// down by `mult`. `rest_amplitude` is the peak output amplitude of the
+    /// undeviated carrier at the bell centre; `block_band` band-limits the
+    /// restored block the way a forward-backward pass of it would. Lines are
+    /// `line_len` samples with the picture over `active_video_us`.
+    pub(crate) fn new(
+        len: usize,
+        samp_rate: f64,
+        mult: u32,
+        rest_amplitude: f64,
+        block_band: &[Sos<f64>],
+        line_len: usize,
+        active_video_us: [f64; 2],
+    ) -> Self {
+        let n = next_fast_len(len);
+        let bin_hz = samp_rate / n as f64;
+        let under_f0 = BELL_F0_HZ / f64::from(mult);
+        // Neither band reaches DC or the Nyquist bin, which the analytic
+        // signal and the real inverse both want kept apart.
+        let per_bin = |response: &dyn Fn(usize, f64) -> Complex64| -> Vec<Complex32> {
+            (0..=n / 2)
+                .map(|bin| {
+                    if bin == 0 || bin == n / 2 {
+                        return Complex32::new(0.0, 0.0);
+                    }
+                    let value = response(bin, bin as f64 * bin_hz);
+                    Complex32::new(value.re as f32, value.im as f32)
+                })
+                .collect()
+        };
+        let bell = per_bin(&|_, freq| 2.0 / anti_bell(freq, under_f0));
+        // A unit phasor of the positive half spectrum comes back from the
+        // real inverse at 2n.
+        let band = sosfiltfft(block_band, n);
+        let scale = rest_amplitude / (2 * n) as f64;
+        let anti_bell =
+            per_bin(&|bin, freq| anti_bell(freq, BELL_F0_HZ) * (band[bin].norm_sqr() * scale));
+
+        let mut real_planner = RealFftPlanner::<f32>::new();
+        let mut planner = FftPlanner::<f32>::new();
+        Self {
+            r2c: real_planner.plan_fft_forward(n),
+            inverse: planner.plan_fft_inverse(n),
+            forward: planner.plan_fft_forward(n),
+            c2r: real_planner.plan_fft_inverse(n),
+            bell,
+            anti_bell,
+            mult,
+            blanking: Blanking::new(samp_rate, line_len, active_video_us, rest_amplitude),
+        }
+    }
+
+    /// The chroma block restored from the colour-under `chroma`.
+    fn restore(&self, chroma: &[f32]) -> Vec<f32> {
+        let n = self.r2c.len();
+        let len = chroma.len();
+        assert!(
+            len <= n,
+            "chroma of {len} samples does not fit the {n}-sample transform sized for the field"
+        );
+        let zero = Complex32::new(0.0, 0.0);
+        let mut padded = vec![0.0f32; n];
+        padded[..len].copy_from_slice(chroma);
+        let mut half = self.r2c.make_output_vec();
+        self.r2c
+            .process(&mut padded, &mut half)
+            .expect("r2c forward FFT failed");
+
+        // The under carrier as an analytic signal with the tape's anti-bell
+        // taken off, which leaves the constant amplitude the divider put out.
+        let mut carrier: Vec<Complex32> = half
+            .iter()
+            .zip(&self.bell)
+            .map(|(&bin, &response)| bin * response)
+            .collect();
+        carrier.resize(n, zero);
+        self.inverse.process(&mut carrier);
+
+        // Limiter and multiplier: the unit phasor raised to the multiplier
+        // carries the phase multiplied up, with no angle ever taken.
+        let envelope: Vec<f32> = carrier[..len].iter().map(|z| z.norm_sqr().sqrt()).collect();
+        let knee = median_radix(&envelope) * LIMITER_KNEE;
+        for (z, &amplitude) in carrier.iter_mut().zip(&envelope) {
+            *z = if amplitude > 0.0 {
+                (*z / amplitude).powu(self.mult) * (amplitude / knee).min(1.0)
+            } else {
+                zero
+            };
+        }
+        carrier[len..].fill(zero);
+        let dr_on_even = self.blanking.dr_on_even(&carrier[..len]);
+
+        self.forward.process(&mut carrier);
+        for ((bin, &restored), &response) in half.iter_mut().zip(&carrier).zip(&self.anti_bell) {
+            *bin = restored * response;
+        }
+        self.c2r
+            .process(&mut half, &mut padded)
+            .expect("c2r inverse FFT failed");
+        padded.truncate(len);
+        if let Some(dr_on_even) = dr_on_even {
+            self.blanking.resynthesize(&mut padded, dr_on_even);
+        }
+        padded
+    }
+}
+
+/// The line blanking of the restored block, rewritten from one line's
+/// picture to the next's: the outgoing carrier glides to its line's rest
+/// carrier over the front porch, steps to the incoming line's over the sync
+/// tip and holds it through the back porch, in one phase from the carrier
+/// measured before the splice to the one measured after it and at the
+/// amplitude the anti-bell gives each frequency.
+struct Blanking {
+    samp_rate: f64,
+    line_len: usize,
+    /// Splice start within the outgoing line.
+    start: usize,
+    /// Splice length, to the incoming line's active video.
+    span: usize,
+    measure: usize,
+    /// Back porch stretch within a line.
+    porch: Range<usize>,
+    /// Weight of the synthesized carrier over the fade ahead of the splice.
+    fade: Vec<f64>,
+    /// Per written sample, and one past the last: the running sums of the
+    /// glide, the step and the closure excursion, each at unit height.
+    sums: Vec<[f64; 3]>,
+    /// Peak amplitude of the undeviated carrier at the bell centre.
+    rest_amplitude: f64,
+    /// Peak amplitude under which each rest carrier is one the limiter let
+    /// collapse.
+    floor: [f64; 2],
+}
+
+impl Blanking {
+    fn new(
+        samp_rate: f64,
+        line_len: usize,
+        active_video_us: [f64; 2],
+        rest_amplitude: f64,
+    ) -> Self {
+        let px = |us: f64| (us * samp_rate / 1e6).round() as usize;
+        let active_start = px(active_video_us[0]);
+        let start = px(active_video_us[1] - SPLICE_LEAD_US);
+        let (fade, ramp, taper) = (px(FADE_US), px(RAMP_US), px(BUMP_TAPER_US));
+        let measure = px(MEASURE_US);
+        assert!(
+            fade + measure <= start && start < line_len && px(PORCH_US[0]) <= active_start,
+            "active_video_us of {active_video_us:?} us leaves no room to resynthesize the line blanking"
+        );
+        let next_line = line_len - start;
+        let span = next_line + active_start;
+        let line_us = line_len as f64 * 1e6 / samp_rate;
+        let from_next_line = |us: f64| px(line_us + us) - start;
+        let step = from_next_line(STEP_US[0])..from_next_line(STEP_US[1]);
+        let bump = from_next_line(BUMP_US[0])..from_next_line(BUMP_US[1]);
+        assert!(
+            ramp <= step.start.min(bump.start)
+                && step.end.max(bump.end) <= span
+                && 2 * taper < bump.len(),
+            "line blanking of {span} samples is too short to resynthesize"
+        );
+
+        let raised_cosine = |k: usize, len: usize| 0.5 - 0.5 * (PI * k as f64 / len as f64).cos();
+        // Glide, step and excursion at each written sample; the fade runs on
+        // the outgoing carrier as measured.
+        let shape = |written: usize| -> [f64; 3] {
+            let Some(k) = written.checked_sub(fade) else {
+                return [1.0, 0.0, 0.0];
+            };
+            let glide = if k < ramp {
+                1.0 - raised_cosine(k, ramp)
+            } else {
+                0.0
+            };
+            let stepped = if k < step.start {
+                0.0
+            } else if k < step.end {
+                raised_cosine(k - step.start, step.len())
             } else {
                 1.0
-            }
-        })
-        .collect();
-    let bump_area: f64 = bump.iter().sum();
-    let q = FADE_LEN;
-    let mut cleaned = chroma.to_vec();
-
-    for line in first_line..linesout.saturating_sub(1) {
-        let line_is_dr = (line % 2 == 0) == dr_on_even;
-        let (f_out_rest, f_in_rest) = (rest_hz(line_is_dr), rest_hz(!line_is_dr));
-        let start = line * outwidth + blank_start_px;
-        let end = start + layout.span;
-        if start < 2 * MEAS_LEN + q || end + 2 * MEAS_LEN > chroma.len() {
-            continue;
-        }
-        // The windows never overlap an earlier line's rewrite, so they read
-        // the original chroma.
-        let outgoing = measure_carrier(chroma, samp_rate, start - MEAS_LEN, MEAS_LEN, f_out_rest);
-        let incoming = measure_carrier(chroma, samp_rate, end, MEAS_LEN, f_in_rest);
-        let (Some(outgoing), Some(incoming)) = (outgoing, incoming) else {
-            continue;
+            };
+            let excursion = if bump.contains(&k) {
+                let edge = (k - bump.start).min(bump.end - 1 - k);
+                raised_cosine(edge.min(taper), taper)
+            } else {
+                0.0
+            };
+            [glide, stepped, excursion]
         };
-        // Amplitudes from the band-passed envelope, as the narrowband
-        // correlation under-reads a deviating FM carrier and an amplitude
-        // step at the splice reads as a click downstream; measured a little
-        // away from the splice, where the envelope is still inflated by the
-        // band-pass smear of the adjacent transient.
-        let amp_out = f64::from(median_from_values(
-            &mut envelope[start - 2 * MEAS_LEN..start - MEAS_LEN].to_vec(),
-        ));
-        let amp_in = f64::from(median_from_values(
-            &mut envelope[end + MEAS_LEN..end + 2 * MEAS_LEN].to_vec(),
-        ));
-
-        // Frequency profile over the write region, `q` samples ahead of
-        // `start` to `end`.
-        let mut profile = vec![f_in_rest; q + layout.span];
-        profile[..q].fill(outgoing.freq);
-        for (freq, &r) in profile[q..q + RAMP_LEN].iter_mut().zip(&ramp) {
-            *freq = outgoing.freq + (f_out_rest - outgoing.freq) * r;
+        let mut sums = vec![[0.0; 3]; fade + span + 1];
+        for written in 0..fade + span {
+            let (so_far, here) = (sums[written], shape(written));
+            sums[written + 1] = std::array::from_fn(|term| so_far[term] + here[term]);
         }
-        profile[q + RAMP_LEN..q + layout.step.start].fill(f_out_rest);
-        for (freq, &r) in profile[q + layout.step.start..q + layout.step.end]
-            .iter_mut()
-            .zip(&step)
-        {
-            *freq = f_out_rest + (f_in_rest - f_out_rest) * r;
-        }
-
-        // Close the phase against the incoming carrier: the bump's area is
-        // the absorbed phase; whatever exceeds its cap (degenerately short
-        // blanking only) becomes a constant offset across the hold, never
-        // more than a few kHz.
-        let phase0 = outgoing.phase_at((start - q) as f64);
-        let (_, phase_end) = integrate_phase(&profile, phase0, samp_rate);
-        let err = wrap_phase(incoming.phase_at(end as f64) - phase_end);
-        let bump_capacity = TAU * BUMP_MAX_HZ * bump_area / samp_rate;
-        let err_bump = err.clamp(-bump_capacity, bump_capacity);
-        let bump_amp = err_bump * samp_rate / (TAU * bump_area);
-        for (freq, &shape) in profile[q + layout.bump.start..q + layout.bump.end]
-            .iter_mut()
-            .zip(&bump)
-        {
-            *freq += bump_amp * shape;
-        }
-        let spill = (err - err_bump) * samp_rate / (TAU * layout.hold.len() as f64);
-        for freq in &mut profile[q + layout.hold.start..q + layout.hold.end] {
-            *freq += spill;
-        }
-        let (phase, _) = integrate_phase(&profile, phase0, samp_rate);
-
-        let amp_step = (amp_in - amp_out) / (profile.len() - 1) as f64;
-        for (k, (sample, &phase)) in cleaned[start - q..end].iter_mut().zip(&phase).enumerate() {
-            let synth = (amp_out + amp_step * k as f64) * phase.cos();
-            let blend = fade.get(k).copied().unwrap_or(1.0);
-            *sample = (f64::from(*sample) * (1.0 - blend) + synth * blend) as f32;
+        assert!(
+            BUMP_MAX_HZ * sums[fade + span][2] / samp_rate >= 0.5,
+            "the sync pulse is too short to close half a turn of carrier phase"
+        );
+        Self {
+            samp_rate,
+            line_len,
+            start,
+            span,
+            measure,
+            porch: active_start - px(PORCH_US[0])..active_start - px(PORCH_US[1]),
+            fade: (0..fade).map(|k| raised_cosine(k, fade)).collect(),
+            sums,
+            rest_amplitude,
+            floor: REST_HZ.map(|rest_hz| {
+                f64::from(LIMITER_KNEE) * rest_amplitude * anti_bell(rest_hz, BELL_F0_HZ).norm()
+            }),
         }
     }
-    cleaned
+
+    /// Whether the even rows of the multiplied `carrier` are the D'R lines,
+    /// from the back porch frequency of the even rows against the odd ones;
+    /// `None` when the two do not sit a rest carrier pair apart.
+    fn dr_on_even(&self, carrier: &[Complex32]) -> Option<bool> {
+        let mut rotation = [Complex32::new(0.0, 0.0); 2];
+        for (row, line) in carrier.chunks_exact(self.line_len).enumerate() {
+            rotation[row % 2] += line[self.porch.clone()]
+                .windows(2)
+                .map(|pair| pair[1] * pair[0].conj())
+                .sum::<Complex32>();
+        }
+        let hz = |rotation: Complex32| f64::from(rotation.arg()) * self.samp_rate / TAU;
+        let split = hz(rotation[0]) - hz(rotation[1]);
+        (split.abs() > (REST_HZ[0] - REST_HZ[1]) / 2.0).then_some(split > 0.0)
+    }
+
+    /// Peak amplitude of the carrier in `window`, its frequency, and its
+    /// phase at the window centre. The window is correlated against
+    /// `rest_hz`: the turn between its two halves is the offset from it.
+    fn measure(&self, window: &[f32], rest_hz: f64) -> (f64, f64, f64) {
+        let rotor_step = TAU * rest_hz / self.samp_rate;
+        let half = window.len() / 2;
+        let mut power = 0.0;
+        let mut halves = [Complex64::new(0.0, 0.0); 2];
+        for (k, &sample) in window.iter().enumerate() {
+            let sample = f64::from(sample);
+            power += sample * sample;
+            halves[usize::from(k >= half)] +=
+                Complex64::from_polar(sample, -rotor_step * k as f64);
+        }
+        let offset_step = (halves[1] * halves[0].conj()).arg() / half as f64;
+        let centre = (window.len() - 1) as f64 / 2.0;
+        (
+            (2.0 * power / window.len() as f64).sqrt(),
+            rest_hz + offset_step * self.samp_rate / TAU,
+            (halves[0] + halves[1]).arg() + rotor_step * centre,
+        )
+    }
+
+    /// Rewrite the blanking between the rows of `block`. A splice with no
+    /// carrier on either side is left alone.
+    fn resynthesize(&self, block: &mut [f32], dr_on_even: bool) {
+        let hz_step = TAU / self.samp_rate;
+        let (fade, measure) = (self.fade.len(), self.measure);
+        let centre = (measure - 1) as f64 / 2.0;
+        let written = fade + self.span;
+        for row in 0..block.len() / self.line_len {
+            let start = row * self.line_len + self.start;
+            let end = start + self.span;
+            if end + measure > block.len() {
+                break;
+            }
+            let outgoing = usize::from((row % 2 == 0) != dr_on_even);
+            let rest_hz = [REST_HZ[outgoing], REST_HZ[1 - outgoing]];
+            let (amplitude_out, hz_out, phase_out) =
+                self.measure(&block[start - measure..start], rest_hz[0]);
+            let (amplitude_in, hz_in, phase_in) =
+                self.measure(&block[end..end + measure], rest_hz[1]);
+            if amplitude_out < self.floor[outgoing] || amplitude_in < self.floor[1 - outgoing] {
+                continue;
+            }
+
+            // The phase run from the outgoing carrier, then the excursion
+            // that lands it on the incoming one.
+            let phase_start =
+                phase_out + hz_step * hz_out * (measure as f64 - fade as f64 - centre);
+            let (glide, step) = (hz_out - rest_hz[0], rest_hz[1] - rest_hz[0]);
+            let open = |k: usize| {
+                let [glided, stepped, _] = self.sums[k];
+                phase_start + hz_step * (rest_hz[0] * k as f64 + glide * glided + step * stepped)
+            };
+            let miss = phase_in - hz_step * hz_in * centre - open(written);
+            let excursion = ((miss + PI).rem_euclid(TAU) - PI) / self.sums[written][2];
+
+            let phase_at = |k: usize| open(k) + excursion * self.sums[k][2];
+            for (k, sample) in block[start - fade..end].iter_mut().enumerate() {
+                let phase = phase_at(k);
+                let hz = (phase_at(k + 1) - phase) / hz_step;
+                let amplitude = self.rest_amplitude * anti_bell(hz, BELL_F0_HZ).norm();
+                let carrier = amplitude * phase.cos();
+                let weight = self.fade.get(k).copied().unwrap_or(1.0);
+                *sample = (f64::from(*sample) * (1.0 - weight) + carrier * weight) as f32;
+            }
+        }
+    }
 }
 
-/// The restored chroma block of a field, band-passed to the block and zeroed
-/// before the first line with colour. A first pass identifies the lines;
-/// with a confident fit the blanking intervals are regenerated in the
-/// colour-under domain and the restoration runs again on the cleaned
-/// signal. No per-line AGC: the amplitude envelope is the bell's, and
-/// normalizing every line to its porch level would flatten the intended
-/// foR/foB rest amplitude difference.
+/// The restored chroma block of a field, zeroed up to the line colour comes
+/// back on after a field without it. No per-line AGC: the limiter sets the
+/// carrier amplitude and the anti-bell shapes it, and normalizing every line
+/// to its porch level would flatten the intended foR/foB rest amplitude
+/// difference.
 pub(super) fn process_chroma(
     field: &DecodedField,
-    spec: &DecoderSpec,
+    playback: &Method1Playback,
     chroma: &[f32],
-    mult: u32,
 ) -> Vec<f32> {
-    let outwidth = field.outlinelen;
-    // Peak amplitude putting the undeviated carrier near the porch RMS level
-    // the other formats' chroma AGC normalizes to.
-    let burst_abs_ref = spec
-        .sys_burst_abs_ref
-        .expect("chroma output without burst_abs_ref");
-    let rest_amplitude = burst_abs_ref * 2f32.sqrt();
-    let first_line = match field.burst_start_line() {
-        line if line > 0 => STARTING_LINE.max(field.output_row(line as usize)),
-        _ => STARTING_LINE,
-    };
-    let porch_end_px = usectooutpx(spec, spec.sys_active_video_us[0]) as usize;
-    // The record chain's blanking-edge transient sets in slightly before the
-    // nominal end of active video (the source's own blanking edge lands
-    // inside the TBC active window), so the splice starts a little early.
-    let blank_start_px = usectooutpx(spec, spec.sys_active_video_us[1] - 0.85) as usize;
-
-    let pass1 = upconvert(chroma, spec, mult, rest_amplitude);
-    let fit = fit_line_alternation(&pass1.inst_freq, outwidth, first_line, porch_end_px)
-        .filter(|fit| fit.confidence >= IDENT_MIN_CONFIDENCE);
-    let layout = BlankingLayout::new(outwidth, blank_start_px, porch_end_px);
-    let restored = match fit.zip(layout) {
-        Some((fit, layout)) => {
-            tracing::debug!(
-                confidence = fit.confidence,
-                dr_on_even = fit.dr_on_even,
-                "SECAM blanking reference regenerated"
-            );
-            let cleaned = regenerate_blanking(
-                chroma,
-                &pass1.envelope,
-                spec.tbc_sample_rate(),
-                outwidth,
-                &layout,
-                blank_start_px,
-                first_line,
-                fit.dr_on_even,
-                mult,
-            );
-            upconvert(&cleaned, spec, mult, rest_amplitude).signal
-        }
-        None => {
-            tracing::debug!("SECAM blanking left as-is (line identification confidence too low)");
-            pass1.signal
-        }
-    };
-
-    let mut block = sosfiltfilt_f32(&spec.chroma_filter_final, &restored);
-    let blanked = (first_line * outwidth).min(block.len());
-    block[..blanked].fill(0.0);
+    let mut block = playback.restore(chroma);
+    if let Ok(line @ 1..) = usize::try_from(field.burst_start_line()) {
+        let blanked = (field.output_row(line) * field.outlinelen).min(block.len());
+        block[..blanked].fill(0.0);
+    }
     block
 }

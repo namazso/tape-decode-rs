@@ -413,8 +413,8 @@ fn process_chroma_internal(
             tracing::debug!(offset_hz = offset, "SECAM carrier servo measurement");
         }
     }
-    if let Some(mult) = spec.decoder_chroma_carrier_mult {
-        let restored = secam::process_chroma(field, spec, &chroma, mult);
+    if let Some(playback) = &spec.secam_method1_playback {
+        let restored = secam::process_chroma(field, playback, &chroma);
         return encode_chroma(&restored);
     }
     let is_ntsc = spec.color_system == ColorSystem::Ntsc;
@@ -505,7 +505,7 @@ pub(crate) fn decode_chroma(
 
 /// Analytic signal of `data` (its Hilbert transform as the imaginary part)
 /// through the zero-padded transform pair.
-pub(super) fn analytic_signal(
+fn analytic_signal(
     data: &[f32],
     (r2c, inverse): &(Arc<dyn RealToComplex<f32>>, Arc<dyn Fft<f32>>),
 ) -> Vec<Complex32> {
@@ -522,7 +522,7 @@ pub(super) fn analytic_signal(
 }
 
 /// Phase advance from `a` to `b`, in (-pi, pi].
-pub(super) fn phase_step(a: Complex32, b: Complex32) -> f32 {
+fn phase_step(a: Complex32, b: Complex32) -> f32 {
     let product = b * a.conj();
     atan2_precise(product.im, product.re)
 }

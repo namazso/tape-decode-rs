@@ -7,8 +7,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::decode::{
-    gen_chroma_heterodyne, ChromaFftFilter, ChromaSepClass, BLOCKCUT, BLOCKCUT_END, BLOCKSIZE,
-    SECAM_LO_TRIM_LIMIT_HZ,
+    gen_chroma_heterodyne, ChromaFftFilter, ChromaSepClass, Method1Playback, BLOCKCUT,
+    BLOCKCUT_END, BLOCKSIZE, SECAM_LO_TRIM_LIMIT_HZ,
 };
 use crate::optimized::{narrow_sos, SincLut};
 use crate::request::{
@@ -107,7 +107,6 @@ pub struct DecoderSpec {
 
     pub(crate) decoder_color_under_carrier: f64,
     pub(crate) decoder_chroma_conversion_lo: Option<f64>,
-    pub(crate) decoder_chroma_carrier_mult: Option<u32>,
     pub(crate) decoder_chroma_rotation: Option<[i64; 2]>,
     pub(crate) decoder_chroma_offset: f64,
     pub(crate) decoder_nonlinear_highpass_limit_l: f32,
@@ -127,10 +126,9 @@ pub struct DecoderSpec {
 
     pub(crate) chroma_afc_narrowband: Vec<Vec<Sos<f32>>>,
     pub(crate) chroma_afc_fine_tune_fh_ratio: f64,
-    // Whole-field analytic-signal transform pair (the ME-SECAM carrier servo
-    // and the SECAM method 1 restoration): a real forward transform and the
-    // complex inverse, at a fast length padded past the field. None unless
-    // one of them runs.
+    // Whole-field analytic-signal transform pair of the ME-SECAM carrier
+    // servo: a real forward transform and the complex inverse, at a fast
+    // length padded past the field. None unless the servo runs.
     pub(crate) secam_analytic_fft: Option<(Arc<dyn RealToComplex<f32>>, Arc<dyn Fft<f32>>)>,
 
     pub(crate) dod_threshold_p: f32,
@@ -171,9 +169,9 @@ pub struct DecoderSpec {
     // variants restore their block elsewhere and keep the block-anchored
     // `chroma_filter_final`.
     pub(crate) chroma_fft_filter: Option<ChromaFftFilter>,
-    // Post-TBC band-pass around the SECAM method 1 under carriers, ahead of
-    // the phase multiplication.
-    pub(crate) secam_under_filter: Option<Vec<Sos<f32>>>,
+    // Playback chain restoring the SECAM method 1 chroma block; None unless
+    // the format counts its carrier down and the chroma is written.
+    pub(crate) secam_method1_playback: Option<Method1Playback>,
 
     pub(crate) video_rf_filter: Vec<f32>,
     pub(crate) video_notch_filter: Option<Vec<f32>>,
@@ -740,9 +738,7 @@ impl DecoderSpec {
             (Vec::new(), Vec::new())
         };
         let rf_secam_carrier_servo = request.rf_secam_carrier_servo;
-        let secam_analytic_fft = if (conversion_lo.is_some() && rf_secam_carrier_servo)
-            || carrier_mult.is_some()
-        {
+        let secam_analytic_fft = if conversion_lo.is_some() && rf_secam_carrier_servo {
             // Zero-padded past the field so the Hilbert transform runs at a
             // fast length.
             let n = next_fast_len(fieldlen);
@@ -753,21 +749,23 @@ impl DecoderSpec {
         } else {
             None
         };
-        // The band covers the under carrier pair (1.0625/1.1015625 MHz) plus
-        // the +-126.5 kHz maximum deviation and as much sideband room as fits
-        // below the luma FM area; out-of-band noise would turn straight into
-        // phase noise, which the multiplication amplifies.
-        let secam_under_filter = carrier_mult
-            .map(|_| {
-                butter_sos(
-                    "the SECAM under carrier band-pass",
-                    3,
-                    &[550e3, 1300e3],
-                    tbc_sample_rate,
-                    FilterBandType::Bandpass,
-                )
-            })
-            .transpose()?;
+        let secam_method1_playback = carrier_mult.filter(|_| chroma_output).map(|mult| {
+            // Peak amplitude putting the undeviated carrier near the porch RMS
+            // level the other formats' chroma AGC normalizes to.
+            let burst_abs_ref = sys_params
+                .burst_abs_ref
+                .expect("chroma output without burst_abs_ref");
+            let rest_amplitude = f64::from(burst_abs_ref) * std::f64::consts::SQRT_2;
+            Method1Playback::new(
+                fieldlen,
+                tbc_sample_rate,
+                mult,
+                rest_amplitude,
+                &chroma_filter_final,
+                sys_params.outlinelen,
+                sys_params.active_video_us,
+            )
+        });
 
         let video_chroma_trap = if request.chroma_trap {
             Some(ChromaSepClass::new(freq_hz, sys_params.fsc_mhz))
@@ -838,7 +836,6 @@ impl DecoderSpec {
 
             decoder_color_under_carrier: decoder_params.color_under_carrier,
             decoder_chroma_conversion_lo: conversion_lo,
-            decoder_chroma_carrier_mult: carrier_mult,
             decoder_chroma_rotation: decoder_params.chroma_rotation,
             decoder_chroma_offset: decoder_params.chroma_offset,
             decoder_nonlinear_highpass_limit_l: decoder_params.nonlinear.highpass_limit_l,
@@ -885,7 +882,7 @@ impl DecoderSpec {
             chroma_filter_deemphasis: chroma_filter_deemphasis.map(store_sos_filter),
             chroma_filter_final: store_sos_filter(chroma_filter_final),
             chroma_fft_filter,
-            secam_under_filter: secam_under_filter.map(store_sos_filter),
+            secam_method1_playback,
 
             video_rf_filter: store_real_filter(video_rf_filter),
             video_notch_filter: video_notch_filter.map(store_real_filter),
@@ -1652,7 +1649,7 @@ fn gen_ramp_filter(
     output
 }
 
-fn sosfiltfft(sos: &[Sos<f64>], block_len: usize) -> Vec<Complex64> {
+pub(crate) fn sosfiltfft(sos: &[Sos<f64>], block_len: usize) -> Vec<Complex64> {
     use std::f64::consts::TAU;
 
     let mut output = Vec::with_capacity(block_len);
